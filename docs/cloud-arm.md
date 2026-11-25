@@ -712,7 +712,12 @@ the VM by DHCP; the tools look it up.
   ```
 
   Then connect to `vnc://localhost:5900` as `xnu`. The server offers only Apple's authentication types, so a generic
-  VNC client will not connect. Only the protocol handshake was checked here, not a full session.
+  VNC client will not connect. On a running system `tools/hosted/enable-screen-sharing.sh` (as root in the guest) turns
+  the service on and grants its agent screen capture and input; without the grants a session is refused or cannot
+  click. `tools/cloud/vnc-check.py PORT USER PASSWORD-FILE OUT.png [click X Y]` is a client without a window: it logs in
+  with Apple's authentication, saves one full frame and can send a click. Tested with it through a tunnel from a Mac
+  (Google Cloud C4A, CPU rendering): a 1280x800 frame in 1 to 3 seconds, and a click that the hosted desktop acted on
+  ("Your screen is being controlled" shows there). A session with Apple's Screen Sharing app itself was not run.
 
 ### Screen capture and scripting over ssh
 
@@ -1118,7 +1123,7 @@ Not tested:
 - **Restoring a saved image on a new VM** (section 17).
 - **More than 3 hosted CPUs**, other VM sizes, other clouds, other CPUs, a 16 KB-page host kernel.
 - **Running as a service** (`scripts/install-service.sh`) on this host.
-- **A full Screen Sharing session**; only the handshake.
+- **A session with Apple's Screen Sharing app**; a headless client (`tools/cloud/vnc-check.py`) got frames and clicked.
 - **Long uptimes and load.** The longest runs were hours, not days. No stress run like upstream's was done here.
 - **Which of the three parts of the renderer patch** is needed. The crash dump points at the first.
 
