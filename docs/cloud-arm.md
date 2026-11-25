@@ -973,6 +973,19 @@ compose until all match, and stops if the bucket holds a part the Mac does not h
 
 ### In the hosted system
 
+**The hosted system reaches some sites and not others: `curl https://github.com` connects and then times out, a download
+stops after about 64 KB, while small pages load.**
+Seen on Google Cloud (C4A, `c4a-standard-16`, Ubuntu 24.04, kernel 7.0.0-1017-gcp, gVNIC). Two causes on the Linux side:
+- The path's MTU is 1460 and the hosted `en0` has 1500, so the far end's full-size segments do not fit. A TLS handshake
+  with a large reply (github.com, registry.npmjs.org) never finishes.
+- The uplink has hardware GRO on (`ethtool -k <uplink> | grep rx-gro-hw`). Linux segments its packets again on the way
+  to `xnu0`, and for some of them the segmentation fails (`__skb_gso_segment` returns `-EINVAL` in
+  `validate_xmit_skb`): the packet and every retransmission of it are dropped. `cat /sys/class/net/xnu0/statistics/tx_dropped`
+  climbs while a download is stalled.
+Fix: `scripts/vm-net-up.sh` (run by `xnulinux-boot.sh` at every boot) now clamps the TCP MSS to the path MTU and turns
+hardware GRO off on the uplink; software GRO stays on. Measured after: github.com and the npm registry answer, a 58 MB
+download runs at 85 MB/s, `tx_dropped` does not move.
+
 **Notification and Dock icons are blank squares; `iconservicesagent` crashes again and again
 (`EXC_BAD_ACCESS` in `lp_rast_triangle_32_*` inside `libvulkan_lvp.dylib`); once the window server died the same way
 and the session ended at a login window.**
