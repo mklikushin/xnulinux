@@ -2390,8 +2390,27 @@ static NSUInteger xcmDev_rwTexTier(id, SEL) { return MTLReadWriteTextureTier2; }
 static BOOL xcmDev_yes(id, SEL) { return YES; }
 static BOOL xcmDev_supportsSampleCount(id, SEL, NSUInteger c) { return c == 1; }
 static BOOL xcmDev_supportsFeatureSet(id, SEL, NSUInteger) { return YES; }
+// The bridge's answer for a family, kept. CoreAnimation asks supportsFamily: many times in every frame, and the bridge
+// works each answer out again from its tables (an audit of every row of the family, cloning each format's answers): it
+// was half of WindowServer's main thread while the screen changed (436 of 872 samples under xcmDev_supportsFamily with
+// the desktop at 4 to 5 frames a second). The answer is the device's and does not change while the process lives.
+static BOOL xcmBridgeSupportsFamily(int64_t family) {
+    static std::atomic<uint64_t> slots[32];   // family << 2 | 2 | answer; 0: empty
+    const uint64_t key = ((uint64_t)family << 2) | 2;
+    for (auto &slot : slots) {
+        uint64_t v = slot.load(std::memory_order_acquire);
+        if (v == 0) break;
+        if ((v & ~1ull) == key) return (v & 1) ? YES : NO;
+    }
+    BOOL answer = xm2v_device_supports_family(gXm2vDevice, family) ? YES : NO;
+    for (auto &slot : slots) {
+        uint64_t empty = 0;
+        if (slot.compare_exchange_strong(empty, key | (answer ? 1 : 0), std::memory_order_acq_rel) || (empty & ~1ull) == key) break;
+    }
+    return answer;
+}
 static BOOL xcmDev_supportsFamily(id, SEL, MTLGPUFamily family) {
-    if (gXm2vDevice && xm2v_device_supports_family(gXm2vDevice, (int64_t)family)) return YES;
+    if (gXm2vDevice && xcmBridgeSupportsFamily((int64_t)family)) return YES;
     // Report Apple1/Apple2, Mac1/Mac2, Common1..3 so QuartzCore enables framebuffer fetch (programmable blending)
     // and standard macOS/Apple GPU paths that lavapipe + metal2vulkan support.
     switch ((int64_t)family) {
