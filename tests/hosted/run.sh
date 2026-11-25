@@ -5,6 +5,7 @@
 # both catch 50 of 50 exceptions. Copy this directory into the guest and run: sh run.sh
 # A guest with no compiler (a disk built on Linux has none): build the four programs where there is one, with the two
 # clang lines below, name them keys-arm64, keys-arm64e, exc-arm64, exc-arm64e, and give their folder: sh run.sh FOLDER
+# Then timers.c: one-second waits take a second (the 24 MHz counter macOS expects; prebuilt name: timers-arm64).
 # Prints "hosted tests: pass" and exits 0, or says which check failed and exits 1. Half a minute; first compile is slow.
 set -u
 cd "$(dirname "$0")" || exit 1
@@ -20,4 +21,8 @@ for a in arm64 arm64e; do
   check "keys $a" "$("$O/keys-$a")" "$want"
   check "exc $a" "$("$O/exc-$a" 2>&1 | tail -1)" "caught 50 of 50 exceptions"
 done
+# the counter as macOS expects it: one-second waits take a second through every interface (timers.c)
+if [ -n "$P" ]; then cp "$P/timers-arm64" "$O/" 2>/dev/null || echo "skip timers: no prebuilt timers-arm64 in $P"
+else clang -arch arm64 -o "$O/timers-arm64" timers.c || { echo "FAIL build timers"; bad=1; }; fi
+if [ -x "$O/timers-arm64" ]; then "$O/timers-arm64" || bad=1; fi
 [ $bad = 0 ] && echo "hosted tests: pass" || { echo "hosted tests: FAIL"; exit 1; }
