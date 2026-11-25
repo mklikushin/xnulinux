@@ -55,3 +55,23 @@ return address is not signed.
 
 All three files were run in the hosted system on the cloud VM in the form they have here, with the output above, on
 the Mac-built disk (compiled there) and on a Linux-built disk (with the four programs compiled on the Mac-built one).
+
+## A fault on a thread that has the signal blocked
+
+`faultmask.c` shows what Darwin does with a hardware fault on a thread that has the fault's signal blocked: nothing is
+delivered, and the thread takes the same fault again, forever, at full CPU. It is not part of `run.sh` (it checks a
+property of Darwin, not of the hosted kernel) and it explains
+`gpu/xnu-cpu-metal/patches/mesa/0003-util-thread-fault-signals-unblocked.patch`: Mesa blocks SIGBUS on the threads it
+starts, so a rasteriser thread that jumped to non-executable memory held a CPU instead of ending its process.
+
+```sh
+clang -o faultmask faultmask.c && ./faultmask
+```
+
+```
+fault signals blocked:   still faulting after 2 s
+fault signals unblocked: killed by signal 10
+```
+
+The same two lines on an Apple silicon Mac (macOS 27.2.1) and in the hosted system on a Google Cloud C4A VM, built as
+`arm64` and as `arm64e`. The program kills its own child after two seconds; it leaves nothing running.
