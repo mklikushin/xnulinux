@@ -1,0 +1,160 @@
+Upstream: Mesa 26.3.1 (https://archive.mesa3d.org/mesa-26.3.1.tar.xz)
+Upstream-License: MIT
+Patch-License: MIT (provided under the same license as upstream)
+Subject: llvmpipe: the thread that queues a small scene rasterizes it
+
+Handing a scene to the rasteriser threads costs the same whatever is in it: a semaphore to wake each thread, two
+barriers they all meet at, a semaphore back from each. The window server draws a frame as 60 to 77 render passes, about
+50 of them a few thousand pixels (an icon, a line of menu bar text, a level of a blur), and for those the hand-off is
+all of the time. Measured in the hosted macOS with METAL2VULKAN_ENCODER_TIMES, an empty pass: 0.05 ms with
+LP_NUM_THREADS=0, 0.36 ms with 4, 0.6 ms with 8 (thread wakeups there cost three times what they do on the Linux host).
+
+A scene whose commands may touch at most LP_INLINE_SCENE_PIXELS pixels (each command of a bin counts the bin's tile,
+cut to the framebuffer; 32768 by default, 0 turns this off) is rasterized by the thread that queues it, as the
+LP_NUM_THREADS=0 path does, when the threads have finished every scene handed to them. The caller holds the screen's
+rast_mutex, so no scene is queued meanwhile, and thread 0 is waiting for work, so its task is free.
+
+--- a/src/gallium/drivers/llvmpipe/lp_rast.c
++++ b/src/gallium/drivers/llvmpipe/lp_rast.c
+@@ -35,6 +35,8 @@
+ #include "util/u_thread.h"
+ #include "util/u_memset.h"
+ #include "util/os_time.h"
++#include "util/u_atomic.h"
++#include "util/u_debug.h"
+ 
+ #include "lp_scene_queue.h"
+ #include "lp_context.h"
+@@ -1102,6 +1104,69 @@
+ 
+ 
+ /**
++ * Whether a scene is small enough for the thread that queues it to
++ * rasterize it itself.
++ *
++ * Handing a scene to the threads costs the same whatever is in it: a
++ * semaphore to wake each thread, two barriers they all meet at, a
++ * semaphore back from each.  A compositor draws a frame as dozens of
++ * render passes, most of them a few thousand pixels (an icon, a line of
++ * text, a level of a blur), and for those the hand-off is all of the time:
++ * 0.6 ms a pass with eight threads against 0.05 ms for the pixels.
++ *
++ * The estimate is the pixels the commands may touch: each command of a
++ * bin counts the bin's tile, cut to the framebuffer.  LP_INLINE_SCENE_PIXELS
++ * sets the limit, 0 hands every scene to the threads.
++ */
++static bool
++scene_is_small(struct lp_scene *scene)
++{
++   static int64_t limit = -1;
++   if (limit < 0)
++      limit = debug_get_num_option("LP_INLINE_SCENE_PIXELS", 32768);
++   if (limit == 0)
++      return false;
++
++   const unsigned samples = MAX2(1, scene->fb_max_samples);
++   int64_t pixels = 0;
++
++   for (unsigned y = 0; y < scene->tiles_y; y++) {
++      const unsigned top = y * TILE_SIZE;
++      const unsigned h = top < scene->fb.height ?
++         MIN2(TILE_SIZE, scene->fb.height - top) : 0;
++
++      for (unsigned x = 0; x < scene->tiles_x; x++) {
++         const unsigned left = x * TILE_SIZE;
++         const unsigned w = left < scene->fb.width ?
++            MIN2(TILE_SIZE, scene->fb.width - left) : 0;
++         const struct cmd_bin *bin = lp_scene_get_bin(scene, x, y);
++         unsigned cmds = 0;
++
++         for (const struct cmd_block *block = bin->head; block;
++              block = block->next) {
++            for (unsigned k = 0; k < block->count; k++) {
++               switch (block->cmd[k]) {
++               case LP_RAST_OP_SET_STATE:
++               case LP_RAST_OP_BEGIN_QUERY:
++               case LP_RAST_OP_END_QUERY:
++                  break;
++               default:
++                  cmds++;
++               }
++            }
++         }
++
++         pixels += (int64_t)cmds * w * h * samples;
++         if (pixels > limit)
++            return false;
++      }
++   }
++
++   return true;
++}
++
++
++/**
+  * Called by setup module when it has something for us to render.
+  */
+ void
+@@ -1114,7 +1179,32 @@
+    if (rast->last_fence)
+       rast->last_fence->issued = true;
+ 
+-   if (rast->num_threads == 0) {
++   if (rast->num_threads > 0 &&
++       p_atomic_read(&rast->scenes_pending) == 0 &&
++       scene_is_small(scene)) {
++      /* A small scene, and the threads have finished every scene handed
++       * to them (the caller holds the screen's rast_mutex, so none is
++       * queued meanwhile): rasterize it here, as thread 0 would.
++       */
++      unsigned fpstate = util_fpstate_get();
++      util_fpstate_set_denorms_to_zero(fpstate);
++
++      lp_rast_begin(rast, scene);
++
++      rasterize_scene(&rast->tasks[0], scene);
++
++      /* The fence waits for a signal from each thread; rasterize_scene
++       * gave one.
++       */
++      if (scene->fence) {
++         for (unsigned i = 1; i < rast->num_threads; i++)
++            lp_fence_signal(scene->fence);
++      }
++
++      lp_rast_end(rast);
++
++      util_fpstate_set(fpstate);
++   } else if (rast->num_threads == 0) {
+       /* no threading */
+       unsigned fpstate = util_fpstate_get();
+ 
+@@ -1134,6 +1224,7 @@
+       rast->curr_scene = NULL;
+    } else {
+       /* threaded rendering! */
++      p_atomic_inc(&rast->scenes_pending);
+       lp_scene_enqueue(rast->full_scenes, scene);
+ 
+       /* signal the threads that there's work to do */
+@@ -1219,6 +1310,8 @@
+        */
+       if (task->thread_index == 0) {
+          lp_rast_end(rast);
++         /* Every thread is past the barrier: the scene is finished. */
++         p_atomic_dec(&rast->scenes_pending);
+       }
+ 
+       /* signal done with work */
+--- a/src/gallium/drivers/llvmpipe/lp_rast_priv.h
++++ b/src/gallium/drivers/llvmpipe/lp_rast_priv.h
+@@ -134,6 +134,9 @@
+    util_barrier barrier;
+ 
+    struct lp_fence *last_fence;
++
++   /** Scenes handed to the threads that they have not finished (atomic) */
++   int scenes_pending;
+ };
+ 
+ 
