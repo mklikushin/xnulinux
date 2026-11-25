@@ -1,0 +1,20 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+# guest-login: type the guest user's password and Return into the hosted macOS, for a login or lock window (after a
+# window-server crash the session ends there). The password is read from GUEST_PASSWORD_FILE and sent over ssh's stdin:
+# it is never echoed and never part of a command line.
+# Before running it: take a fresh guest-screenshot and SEE the password field (the dump lags by seconds; typed blind,
+# the password goes to whatever has the keyboard). Click the field first if it has no focus. Not safe to repeat blindly.
+# Do not run it while the screen is being recorded.
+# Exit: 0 keystrokes sent, 1 failed, 2 GUEST_PASSWORD_FILE missing or unreadable.
+# Status: only syntax-checked in this cleaned form; the private original unlocked a locked session.
+. "$(dirname "$0")/lib.sh"
+[ "${1:-}" = --help ] || [ "${1:-}" = -h ] && { show_help; exit 0; }
+need GUEST_PASSWORD_FILE; need_file "$GUEST_PASSWORD_FILE" "the guest user's password, one line"
+w=${GUEST_SCREEN%x*}; h=${GUEST_SCREEN#*x}
+vm_ssh "cd ~/'$VM_REPO' && python3 -c '
+import sys, importlib.util
+s = importlib.util.spec_from_file_location(\"xi\", \"tools/hosted/xnu-input.py\"); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+d = m.Input(\"/var/tmp/xnu-input\", $w, $h); d.type(sys.stdin.readline().rstrip(chr(10))); d.keys([m.KEYS[\"return\"]])
+'" < "$GUEST_PASSWORD_FILE" || die "could not send the keystrokes"
+echo "password typed and Return sent (check with guest-screenshot)"

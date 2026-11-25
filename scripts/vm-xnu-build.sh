@@ -9,9 +9,11 @@ if [ ! -x /usr/lib/llvm-21/bin/clang ]; then
   echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm21.list
   sudo apt-get update -qq
 fi
+# p7zip-full is gone from Ubuntu 26.04 (no install candidate; 7zip provides 7z there): ask for it only where apt has it
+P7ZIP=; apt-cache policy p7zip-full 2>/dev/null | grep -q 'Candidate: [0-9]' && P7ZIP=p7zip-full
 sudo -E apt-get install -y -qq build-essential autoconf automake libtool pkg-config git python3 python3-yaml python3-packaging \
   cmake ninja-build meson bison flex m4 unifdef tcsh pax libbsd-dev uuid-dev libssl-dev zlib1g-dev cpio xz-utils zstd llvm-21 clang-21 lld-21 \
-  libmd-dev linux-headers-$(uname -r) 7zip p7zip-full >/dev/null
+  libmd-dev linux-headers-$(uname -r) 7zip $P7ZIP >/dev/null
 mkdir -p ~/w && cd ~/w
 [ -d dvm ] || git clone -q https://github.com/Droid-VM/macOS-DroidVM dvm
 cd dvm

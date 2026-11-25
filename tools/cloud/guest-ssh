@@ -1,0 +1,13 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+# guest-ssh [ssh options] ['command']: ssh into the hosted macOS (GUEST_USER, GUEST_KEY) from your own machine, jumping
+# through the cloud VM. The guest's address is GUEST_IP or the newest DHCP lease on the VM. Needs Remote Login enabled on
+# the disk (mac/disk-extras.sh does it). Never asks for anything (BatchMode).
+#   guest-ssh 'sw_vers'
+#   guest-ssh -L 5900:localhost:5900 -N      tunnel for Screen Sharing (then connect to localhost:5900 from a Mac)
+#   guest-ssh 'sudo -S -p "" true' < "$GUEST_PASSWORD_FILE"     root: the password goes over stdin, never on a command line
+# Exit: the command's status; 255 when ssh could not connect.
+# Status: run against the live system in this cleaned form.
+. "$(dirname "$0")/lib.sh"
+[ "${1:-}" = --help ] || [ "${1:-}" = -h ] && { show_help; exit 0; }
+guest_ssh "$@"

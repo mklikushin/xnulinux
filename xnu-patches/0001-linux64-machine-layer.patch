@@ -856,7 +856,7 @@ index a191eb3..035b1a8 100644
  	LOAD_KERN_STACK_TOP	dst=x1, src=x0, tmp=x2	// Get the top of the kernel stack
  	load_general_registers	x1, 2
  	set_process_dependent_keys_and_sync_context	x0, x1, x2, x3, w4
-@@ -444,3 +442,199 @@ LEXT(machine_set_current_thread)
+@@ -444,3 +442,204 @@ LEXT(machine_set_current_thread)
  
  
  /* vim: set ts=4: */
@@ -925,12 +925,17 @@ index a191eb3..035b1a8 100644
 +	ldr		x10, [x11, TH_CTH_SELF]				// the user's TSD (Darwin reads it from TPIDRRO_EL0)
 +	msr		TPIDRRO_EL0, x10
 +	/*
-+	 * x1: JOP off for this thread (arm64, not arm64e): EnIA (31) and EnDA (27) off at EL0. Only after the last
-+	 * kernel pointer authentication (LOAD_KERN_STACK_TOP authenticates; with EnDA off it would trap to brk).
++	 * x1: JOP off for this thread (arm64, not arm64e): all four keys, EnIA (31), EnIB (30), EnDA (27) and EnDB (13),
++	 * off at EL0, as Apple hardware runs such a process. Its return addresses are unsigned, and the arm64e system
++	 * unwinder authenticates each frame's with the IB key: with EnIB on, an exception thrown in an arm64 process
++	 * ends in EXC_ARM_PAC_FAIL. Only after the last kernel pointer authentication (LOAD_KERN_STACK_TOP
++	 * authenticates; with EnDA off it would trap to brk).
 +	 */
 +	cbz		x1, 1f
 +	mrs		x10, SCTLR_EL1
 +	mov		x11, #((1 << 31) | (1 << 27))
++	orr		x11, x11, #(1 << 30)
++	orr		x11, x11, #(1 << 13)
 +	bic		x10, x10, x11
 +	msr		SCTLR_EL1, x10
 +1:
@@ -1049,7 +1054,7 @@ index a191eb3..035b1a8 100644
 +	ldr		x10, [x9, #16]
 +	msr		VBAR_EL1, x10
 +	ldr		x18, [x9, #24]						// the host's x18 again (user code owns x18 at EL0)
-+	ldr		x10, [x9, #32]						// SCTLR_EL1 as the kernels expect it (EnIA/EnDA back on)
++	ldr		x10, [x9, #32]						// SCTLR_EL1 as the kernels expect it (the keys back on)
 +	msr		SCTLR_EL1, x10
 +	isb
 +	mov		x0, sp
@@ -1515,7 +1520,7 @@ index d8f1b19..3fac7b4 100644
  #endif
  
  #include <prng/entropy.h>
-@@ -3646,3 +3648,274 @@ sleh_panic_lockdown_should_initiate_el1_sp0_sync(uint64_t esr, uint64_t elr,
+@@ -3646,3 +3648,275 @@ sleh_panic_lockdown_should_initiate_el1_sp0_sync(uint64_t esr, uint64_t elr,
  }
  __SECURITY_STACK_DISALLOWED_POP
  #endif /* CONFIG_SPTM */
@@ -1637,8 +1642,9 @@ index d8f1b19..3fac7b4 100644
 +	}
 +	/*
 +	 * An arm64 (not arm64e) process runs the arm64e system libraries with JOP off: Apple hardware disables the user
-+	 * IA/DA keys for it; hosted, user code runs with SCTLR_EL1.EnIA/EnDA cleared (linux64_el0_run puts them back on
-+	 * the next exception), or a blraaz on one of its unsigned function pointers fails (EXC_ARM_PAC_FAIL).
++	 * keys for it; hosted, user code runs with SCTLR_EL1.EnIA/EnIB/EnDA/EnDB cleared (linux64_el0_run puts them back
++	 * on the next exception), or a blraaz on one of its unsigned function pointers, or the unwinder's autib of one of
++	 * its unsigned return addresses, fails (EXC_ARM_PAC_FAIL).
 +	 */
 +#if PRECISE_USER_KERNEL_TIME
 +	recount_enter_user();		/* user time vs system time, as locore's return to user space does */

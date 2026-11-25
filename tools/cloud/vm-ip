@@ -1,0 +1,11 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+# vm-ip [--refresh]: print the cloud VM's address. With VM_HOST set that is all it does. Without it, the external address
+# of GCP_INSTANCE in GCP_ZONE is looked up with gcloud once and cached (gcloud is slow to start; the address changes only
+# when the VM restarts): run "vm-ip --refresh" after a VM restart. Safe to run repeatedly.
+# Exit: 0 address printed, 1 lookup failed, 2 a setting is missing.
+# Status: the cached-lookup logic ran daily in its private form; this cleaned version was run with VM_HOST set only.
+. "$(dirname "$0")/lib.sh"
+[ "${1:-}" = --help ] || [ "${1:-}" = -h ] && { show_help; exit 0; }
+if [ "${1:-}" = --refresh ]; then rm -f "$CLOUD_STATE/vm-host"; elif [ $# -gt 0 ]; then usage_error "unknown argument $1"; fi
+vm_host

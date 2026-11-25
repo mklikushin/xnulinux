@@ -1,0 +1,13 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+# guest-console 'command line' [WAIT_SECONDS=6] [LINES=40]: run one line in the hosted macOS's root shell on /dev/console
+# (the launchd job xnulinux.shell that scripts/mk-macvm-disk.sh installs) and print what the console showed afterwards.
+# Works before login and without ssh in the guest. The line is appended to the console input file on the VM; the
+# output is read from the VM's kernel log, which this CLEARS first (sudo dmesg -C). Keep lines short: the console is slow.
+# Exit: 0 line sent and log read (the command's own status is not known), 1 failed, 2 wrong usage.
+# Status: only syntax-checked in this cleaned form; the private original was used throughout.
+. "$(dirname "$0")/lib.sh"
+[ "${1:-}" = --help ] || [ "${1:-}" = -h ] && { show_help; exit 0; }
+[ $# -ge 1 ] && [ $# -le 3 ] || usage_error "usage: guest-console 'command line' [wait] [lines]"
+case "${2:-6}${3:-40}" in *[!0-9]*) usage_error "wait and lines must be numbers";; esac
+printf '%s\n' "$1" | vm_ssh "sudo dmesg -C; cat >> \"\${CONSOLE_IN:-/var/tmp/console-in}\"; sleep ${2:-6}; sudo dmesg | grep -a 'darwin console: ' | sed 's/.*darwin console: //' | cut -c1-240 | tail -${3:-40}"

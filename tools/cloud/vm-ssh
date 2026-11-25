@@ -1,0 +1,10 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+# vm-ssh 'command': run a command on the cloud VM over ssh (VM_HOST, VM_USER, VM_KEY). Never asks for anything
+# (BatchMode): a key that needs a passphrase must be in your ssh agent. Host keys are kept in the tools' own known_hosts.
+# Exit: the command's status; 255 when ssh could not connect; 2 for wrong usage.
+# Status: run against the live VM in this cleaned form.
+. "$(dirname "$0")/lib.sh"
+[ "${1:-}" = --help ] || [ "${1:-}" = -h ] && { show_help; exit 0; }
+[ $# -ge 1 ] || usage_error "no command given"
+vm_ssh "$*"

@@ -1,0 +1,13 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+# vm-run SCRIPT [args]: copy a local shell script to the cloud VM's /tmp and run it there with bash. For the scripts in
+# vm/ and for anything too long to quote on a command line. Arguments are passed on quoted.
+# Exit: the script's status; 1 when the copy failed; 2 for wrong usage.
+# Status: run against the live VM in this cleaned form (with a read-only script).
+. "$(dirname "$0")/lib.sh"
+[ "${1:-}" = --help ] || [ "${1:-}" = -h ] && { show_help; exit 0; }
+[ $# -ge 1 ] || usage_error "no script given"
+[ -r "$1" ] || usage_error "cannot read $1"
+vm_scp "$1" VM:/tmp/ || die "could not copy $1 to the VM"
+s=$(basename "$1"); shift
+vm_ssh "bash /tmp/$s $(printf '%q ' "$@")"

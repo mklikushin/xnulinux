@@ -1,0 +1,15 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+# guest-screenshot OUT.png: a screenshot of the hosted macOS, from the framebuffer dump xnu.ko writes on the VM
+# (tools/hosted/fb2png.py there, then scp). Works with nobody logged in and when ssh into the guest does not. The dump
+# lags the screen by a few seconds: wait before judging what a click did. Safe to run repeatedly.
+# Exit: 0 file written, 1 conversion or copy failed, 2 wrong usage.
+# Status: run against the live system in this cleaned form.
+. "$(dirname "$0")/lib.sh"
+[ "${1:-}" = --help ] || [ "${1:-}" = -h ] && { show_help; exit 0; }
+[ $# -eq 1 ] || usage_error "usage: guest-screenshot OUT.png"
+w=${GUEST_SCREEN%x*}; h=${GUEST_SCREEN#*x}
+vm_ssh "cd ~/'$VM_REPO' && python3 tools/hosted/fb2png.py \"\${FB_DUMP:-/var/tmp/xnu-fb.raw}\" $w $h /var/tmp/xnu-fb.png >/dev/null" \
+  || die "could not convert the framebuffer on the VM (is the hosted system running? is VM_REPO right?)"
+vm_scp VM:/var/tmp/xnu-fb.png "$1" || die "could not copy the screenshot"
+echo "$1: $(wc -c < "$1") bytes"
