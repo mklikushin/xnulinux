@@ -203,10 +203,18 @@ module_param(soc_name, charp, 0444);
 static char *gpu_model;
 module_param(gpu_model, charp, 0444);
 
-/* the compressor's limit is in VM pages: 6 GB either way */
 static const char *cmdline = "debug=0x8 -v -noprogress serial=0 startup_debug=1";
-static const char *cmdline_4k = " vm_compression_limit=1572864";
-static const char *cmdline_16k = " vm_compression_limit=393216 linux64_vm16k=1";
+static const char *cmdline_4k = "";
+static const char *cmdline_16k = " linux64_vm16k=1";
+/*
+ * The compressor's limit in MB (vm_compression_limit, which XNU takes in VM pages): 6 GB by default. XNU claims kernel
+ * address space for the compressor (about 1.8 times the limit) next to the zone map's fixed 24 GB, and what the kernel's
+ * window has for them shrinks as the DRAM grows. With the default, ram_mb above about 8000 no longer fits and the boot
+ * ends in kmem_range_init ("vm_map_store_lookup_hole() failing for claim ..."): a smaller limit makes the room
+ * (ram_mb=16000 boots with compressor_mb=2048).
+ */
+static int compressor_mb = 6144;
+module_param(compressor_mb, int, 0444);
 /* vm16k=1 (the default): XNU's VM pages are 16 KB, as on a Mac, over the host's 4 KB translation granule (XNU's
  * PAGE_RATIO 4): a quarter of the page faults of 4 KB pages; vm16k=0 gives 4 KB VM pages */
 static int vm16k = 1;
@@ -970,6 +978,17 @@ static struct boot_args_v2 *build_boot(unsigned char *base_va, u64_t phys, u64_t
 	{
 		const char *pg = vm16k ? cmdline_16k : cmdline_4k;
 		x_memcpy(ba->CommandLine + x_strlen(ba->CommandLine), pg, x_strlen(pg) + 1);
+	}
+	{
+		const char *a = " vm_compression_limit=";
+		unsigned long pages = ((unsigned long)(compressor_mb > 0 ? compressor_mb : 6144) << 20) >> (vm16k ? 14 : 12);
+		char t[24], *e = ba->CommandLine + x_strlen(ba->CommandLine);
+		int n = 0;
+
+		x_memcpy(e, a, x_strlen(a)); e += x_strlen(a);
+		do { t[n++] = '0' + pages % 10; pages /= 10; } while (pages);
+		while (n) *e++ = t[--n];
+		*e = 0;
 	}
 	if (rd_size || hd_file) {
 		const char *rd = " rd=md0";

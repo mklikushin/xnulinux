@@ -277,6 +277,7 @@ Each line, and why:
 |---|---|
 | `CPUS=3` | The hosted system takes Linux CPUs 0 to 2. The VM has 4; Linux needs one for itself and its device interrupts. 1, 2 and 3 were tried; 4 was not. |
 | `RAM_MB=7900` | The hosted system's memory. It must fit inside the 8156 MB carve-out. |
+| `XNU_ARGS="compressor_mb=2048"` with `RAM_MB=12000` | Optional: more memory. XNU claims fixed kernel address space for the zone map (24 GB) and the compressor (its limit plus about 5 GB), and the room for them shrinks as the memory grows: with the default 6 GB compressor limit the boot panics in `kmem_range_init` above about 8000 MB. `compressor_mb=2048` (a parameter of `xnu.ko`) makes room for 12000 MB, with a carve-out that holds it (`CARVE_MB=12256` or more in section 5). 16000 and 24000 MB do not fit with any limit: the zone map's 24 GB is a build-time constant. Tested: 12000 MB boots to the desktop on a 64 GB C4A VM. |
 | `GPU=off` | There is no GPU and no virtio-gpu device. Everything is drawn on the CPU. |
 | `amfi_get_out_of_my_way=1 lp-sip0=2050` | Upstream's defaults: code-signing enforcement relaxed, as the disk is modified. They must be repeated because `BOOTARGS` replaces the default. |
 | `droidvm-timebase-hz=24000000` | The host's counter runs at 1 GHz; a Mac's runs at 24 MHz, and parts of macOS 27 assume that. The kernel then scales the counter by 3/125 (1 GHz × 3 / 125 = 24 MHz). The cost is in section 14. |
@@ -425,6 +426,9 @@ guest instead, or build the disk again.
 
 - **No developer tools and no third-party applications.** There is no compiler in the guest, so `tests/hosted`
   needs programs built elsewhere (its README says how). Install software inside the guest afterwards.
+  `tools/hosted/install-developer-tools.sh`, run as root in the guest, installs Apple's Command Line Tools (clang, git,
+  make, python3, swift, the macOS SDK) from Apple's update server: 520 MB to fetch, about five minutes on a Google Cloud
+  C4A VM, tested on a disk built by this section. After it `tests/hosted/run.sh` builds its own programs.
 - **No Recovery system.** There is no Recovery container, the Recovery volume is empty, and Preboot holds only the
   App cryptex, not the boot files a real Mac's firmware reads. A hosted boot uses none of them.
 - **Files are stored uncompressed, and without their BSD file flags.** The Linux APFS driver reads Apple's
