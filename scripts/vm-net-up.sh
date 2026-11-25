@@ -14,6 +14,17 @@ sudo iptables -t nat -C POSTROUTING -s 192.168.77.0/24 -o "$up" -j MASQUERADE 2>
 sudo iptables -C FORWARD -i xnu0 -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD -i xnu0 -j ACCEPT
 sudo iptables -C FORWARD -o xnu0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null ||
   sudo iptables -I FORWARD -o xnu0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+# The way out can have a smaller MTU than en0's 1500 (Google Cloud: 1460). Without this the hosted system announces an MSS
+# of 1460, the far end's full-size segments do not fit, and a TLS handshake with a large reply (github.com, npm) never ends.
+sudo iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null ||
+  sudo iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+# An uplink with hardware GRO (gVNIC on Google Cloud) hands Linux packets it has marked for segmentation. xnu0 takes one
+# frame at a time, so Linux segments them again on the way to it, and for some of them __skb_gso_segment returns -EINVAL:
+# validate_xmit_skb drops the packet (xnu0's tx_dropped) and every retransmission of it, and a download into the hosted
+# system stalls after its first packets. With hardware GRO off on the uplink they arrive as they were sent.
+if command -v ethtool >/dev/null && ethtool -k "$up" 2>/dev/null | grep -q '^rx-gro-hw: on'; then
+  sudo ethtool -K "$up" rx-gro-hw off && echo "vm-net-up: hardware GRO off on $up (its packets cannot be forwarded to xnu0)"
+fi
 command -v dnsmasq >/dev/null || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q dnsmasq-base >/dev/null 2>&1
 if command -v dnsmasq >/dev/null; then
   sudo pkill -f 'dnsmasq.*xnu0' 2>/dev/null
