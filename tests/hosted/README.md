@@ -84,3 +84,10 @@ fault signals unblocked: killed by signal 10
 
 The same two lines on an Apple silicon Mac (macOS 27.2.1) and in the hosted system on a Google Cloud C4A VM, built as
 `arm64` and as `arm64e`. The program kills its own child after two seconds; it leaves nothing running.
+
+## Memory
+
+`memverify.c` writes a distinct value into every 16 KB page of N GiB and reads them all back twice. It is not part of
+`run.sh` (it takes as much memory as it is told to). It was the check for `xnu-patches/0009` (the physical aperture
+below the kernel, which lets the hosted system have more than about 8 GB): with `RAM_MB=24000` on a Google Cloud C4A
+VM, `./memverify 20` and two `./memverify 10` at once each end with `0 bad`.
