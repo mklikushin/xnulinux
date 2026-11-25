@@ -62,6 +62,7 @@ if [ -e out/kc/kc27.bin ]; then
   python3 ~/w/poc/scripts/kc-amfi-platform.py out/k27/kc-k27.bin ${AMFI_PLATFORM:-26}
   sudo cp out/k27/kc-k27.bin /lib/firmware/xnu/kc.bin
 fi
+[ -e out/kc/kc27.bin ] || echo "no out/kc/kc27.bin: only the kernel was built, not the collection the boot needs (scripts/fetch-kc27.sh gets it)" >&2
 ls -la out/k27/kernel-k27.macho
 sudo cp out/k27/kernel-k27.macho /lib/firmware/xnu/kernel.macho
 sync	# the VM may be stopped from the host right after (tart/krunkit stop): unsynced pages of the collection would be lost
