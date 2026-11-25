@@ -44,11 +44,30 @@ kernel has; and a kext's load tag.
 4. Boot it: `MAC_CONF=pd.conf DISK=pd.img IMAGE=xnu/kc-free.bin TRUSTCACHE= GPU=off scripts/xnulinux-boot.sh`. The console
    (`CONSOLE_IN`) is PureDarwin's zsh. Its `halt` and `reboot` end the run.
 
+## Apple's kexts, linked on the user's machine
+
+What can be distributed is the kernel, xnulinux's own kexts and `kc-free.bin`. A user who wants to boot macOS links
+Apple's kexts from their own copy of macOS into a collection of their own, and chooses which collection to boot with
+`IMAGE=` (`image=` of `xnu.ko`):
+
+1. In the VM, after `scripts/vm-xnu-rebuild.sh`: `scripts/apple-kc/package.sh KIT` writes the kit: the kernel, its
+   segment slots, xnulinux's kexts (objects and descriptions), `kc-free.bin`, and `kit.json` (the kernelcache it links,
+   by sha256; the Apple kexts to keep; macOS-DroidVM's revision, whose `kc-build` links it; AMFI's platform version).
+   Nothing of Apple's is in it.
+2. On the user's machine (python3 and git): `scripts/apple-kc/link.sh KIT KERNELCACHE [OUTPUT]`, where KERNELCACHE is
+   macOS 27.2's `kernelcache.release.vma2` from its IPSW, as the IM4P (unpacked with `ipsw`) or unpacked. It fetches
+   `kc-build` at the kit's revision and links the collection `vm-xnu-rebuild.sh` links from the same kernelcache, byte
+   for byte. Another kernelcache is refused: the kernel's segment slots were laid out for that one.
+3. `IMAGE=xnu/kc-apple.bin scripts/xnulinux-boot.sh` boots macOS on it; `IMAGE=xnu/kc-free.bin` boots PureDarwin.
+
+An auxiliary collection (Apple's kexts as a layer over `kc-free.bin`, chosen when `xnu.ko` loads) is not used: on arm64
+XNU takes one only from the booter, and adds its kexts only when macOS's `kernelmanagerd` asks, after the root (APFS)
+is mounted, so APFS could not be in it.
+
 ## Not done yet
 
 - corecrypto here is PureDarwin's interim fork. By its own README it is LLM-written and unaudited, and it must not be
   relied on to protect anything.
 - The kernel headers the kexts build against come from this kernel's `installhdrs`. PureDarwin's AMFI stub also needs
   PureDarwin's CoreEntitlements and TrustCache headers.
-- Apple's kexts on top of this collection (an auxiliary collection chosen when `xnu.ko` loads) is the next piece.
 - Tested in the krunkit VM with 1 and 2 hosted CPUs: console shell, `launchctl list`, writes to the root, `halt`.

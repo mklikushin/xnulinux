@@ -54,6 +54,7 @@ if [ -e out/kc/kc27.bin ]; then
     python3 scripts/build-native-kext.py $n $(dirname $j)/$n.cpp -I $NETINC --obj ${KEXT_OBJ:-k27-obj} || { echo "kext $n failed to build: left out"; continue; }
     NATIVE="$NATIVE $j"
   done
+  printf '%s\n' $NATIVE > out/k27/natives.txt	# the kexts of ours in this collection, for scripts/apple-kc/package.sh
   t=$SECONDS; K27_NO_BOOT=1 NATIVE="$NATIVE" bash k27/try.sh 0 2>&1 | tail -3; echo "collection: $((SECONDS - t)) s"
   grep -iE 'error|unresolved|XnuCpuMetal' out/k27/kc-build.log | tail -8 || true
   # AMFI of the collection's macOS expects the code-signature platform version of that build; the system disk's binaries
