@@ -728,7 +728,10 @@ tools/cloud/guest-ssh 'echo PASSWORD | sudo -S sh /tmp/grant.sh'
 
 Check: `screencapture -x /tmp/s.png` writes a 1280x800 image, and
 `osascript -e 'tell application "Finder" to get name of startup disk'` prints `Macintosh HD` at once. Its header says how
-to grant other programs and targets and how to take the grants out again. Tested on a Mac-built disk (macOS 27.2.1) on a
+to grant other programs and targets and how to take the grants out again. macOS 27 still shows one dialog the first time an ssh session
+captures the screen, and again every 30 days (`"com.apple.sshd-session" is requesting to bypass the system private
+window picker`): the capture works anyway; click Allow once with `tools/cloud/guest-input` (writing replayd's
+`ScreenCaptureApprovals.plist` beforehand did not prevent it). Tested on a Mac-built disk (macOS 27.2.1) on a
 Google Cloud C4A VM: denied before, both working after, denied again after `REVOKE=1`.
 
 ## 12. Tuning for CPU rendering
