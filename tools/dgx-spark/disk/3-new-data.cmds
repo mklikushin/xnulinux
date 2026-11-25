@@ -1,0 +1,9 @@
+# sershell.py helper/serial.sock 3-new-data.cmds   (helper guest again; payload.img: the Data archive at 0, overlay.tar at 4 GiB)
+B=$(mount | awk '$3=="/"{print $1}' | sed 's|/dev/\(disk[0-9]*\).*|\1|'); A=/System/Library/Filesystems/apfs.fs/Contents/Resources/apfs.util; for d in /dev/disk[0-9]s[0-9]; do case $d in /dev/${B}s*) continue;; esac; n=$($A -p $d 2>/dev/null | head -1); case "$n" in "Macintosh HD") TSYS=$d;; Preboot) TPRE=$d;; esac; done; CONT=${TSYS%s[0-9]}; echo "sys=$TSYS cont=$CONT"
+newfs_apfs -A -v Data $CONT 2>&1 | tail -3; sleep 2; NEW=; for d in ${CONT}s[0-9] ${CONT}s[0-9][0-9]; do [ -e $d ] || continue; n=$($A -p $d 2>/dev/null | head -1); u=$($A -k $d 2>/dev/null | tail -1); echo "$d $n $u"; [ "$n" = Data ] && [ "$u" != 478C06EB-C8E8-4234-B386-23433F2A8433 ] && NEW=$d; done; echo new=$NEW
+V=/Volumes; Y=/System/Volumes/Update; mount -t apfs -o rw,nobrowse $NEW $V 2>&1 | tail -1; mount -t apfs -o rdonly,nobrowse $TSYS $Y 2>&1 | tail -1; mount | grep -E " on ($V|$Y) "
+RAW=; for d in /dev/disk[0-9]; do [ -e ${d}s1 ] || RAW=/dev/r${d#/dev/}; done; echo raw=$RAW
+@2400 dd if=$RAW bs=1048576 2>/dev/null | tar -xpf - -C $V 2>/dev/null; echo untar=$?; ls $V; df -k $V | tail -1
+rm -rf $V/private/var/keybags/* 2>/dev/null; mkdir -p $V/Users/xnu; T="$Y/System/Library/User Template"; for s in Non_localized English.lproj; do [ -d "$T/$s" ] && cp -a "$T/$s/." $V/Users/xnu/; done
+@1200 dd if=$RAW bs=1048576 skip=4096 2>/dev/null | tar -xpf - -C $V 2>/dev/null; echo overlay=$?; chown -R 501:20 $V/Users/xnu; chmod 755 $V/Users/xnu
+sync; umount $Y; umount $V; sync; echo DATA_DONE

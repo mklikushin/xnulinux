@@ -1,0 +1,24 @@
+From: xnulinux
+Subject: [PATCH] linux64: a halt or restart ends the run in the host
+
+Hosted, there is no machine to halt or reset: halt_all_cpus found no platform handler and span with interrupts masked,
+holding its Linux CPU for good (and the others where they were). The host is told instead (LINUX64_CALL_HALT) and ends
+the run on every CPU.
+---
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -941,6 +941,13 @@
+ __attribute__((noreturn))
+ void
+ halt_all_cpus(boolean_t reboot)
+ {
++	{
++		/* LINUX64 (xnulinux): no machine to halt or reset; the host ends the run (the call does not return). */
++		if (linux64_hook) {
++			printf(reboot ? "MACH Reboot\n" : "CPU halted\n");
++			linux64_call2(LINUX64_CALL_HALT, reboot ? 1 : 0, 0);
++		}
++	}
+ 	if (reboot) {
+ 		printf("MACH Reboot\n");

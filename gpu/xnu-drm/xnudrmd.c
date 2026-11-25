@@ -4,8 +4,9 @@
  * Linux's virtio-gpu render node: each request comes as a host call on /dev/xnu-hostcall (fki), is carried out with an
  * ordinary DRM ioctl, mmap or poll, and answered with the outputs. Mappings are translated into physical addresses
  * (fki's XNU_HOSTCALL_XLATE) so the hosted kernel maps the very same pages into its process: no copies.
+ * A render node of another driver (the machine's own GPU) is served through virglrenderer: xnudrmd_virgl.c.
  *
- * Usage: xnudrmd [render node, default /dev/dri/renderD128]. Run as root (the hostcall device is 0600).
+ * Usage: xnudrmd [-v] [--virgl] [render node, default /dev/dri/renderD128]. Run as root (the hostcall device is 0600).
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -21,9 +22,13 @@
 #include <drm/drm.h>
 #include <drm/virtgpu_drm.h>
 #include "xnudrm_proto.h"
+#include "xnudrmd.h"
 
 struct xnu_hostcall_xlate { uint64_t va, len, out, max; };
 #define XNU_HOSTCALL_XLATE _IOWR('X', 1, struct xnu_hostcall_xlate)
+struct xnu_hostcall_range { uint64_t va, len; };
+#define XNU_HOSTCALL_PIN _IOW('X', 2, struct xnu_hostcall_range)
+#define XNU_HOSTCALL_UNPIN _IOW('X', 3, struct xnu_hostcall_range)
 
 #define MAX_CLIENTS 256
 #define MAX_MAPS 65536
@@ -31,7 +36,8 @@ struct xnu_hostcall_xlate { uint64_t va, len, out, max; };
 
 static const char *node = "/dev/dri/renderD128";
 static int hc = -1;
-static int verbose;
+int verbose;
+static int virgl;
 static int clients[MAX_CLIENTS];	/* DRM fd + 1 (0: free) */
 static struct map { int client; void *va; size_t len; } maps[MAX_MAPS];
 static struct fence { int client; int fd; } fences[MAX_FENCES];	/* fd + 1 */
@@ -128,15 +134,46 @@ static int do_ioctl(int fd, uint32_t client, uint32_t nr, uint8_t *p, uint32_t p
 	return r < 0 ? -errno : 0;
 }
 
+int xnudrmd_pin(void *va, size_t len)
+{
+	struct xnu_hostcall_range r = { (uintptr_t)va, (len + 4095) & ~(size_t)4095 };
+	return ioctl(hc, XNU_HOSTCALL_PIN, &r) ? -errno : 0;
+}
+
+void xnudrmd_unpin(void *va)
+{
+	struct xnu_hostcall_range r = { (uintptr_t)va, 0 };
+	ioctl(hc, XNU_HOSTCALL_UNPIN, &r);
+}
+
+int xnudrmd_ranges(void *va, size_t len, struct xnudrm_range *rg, uint32_t *nr)
+{
+	uint32_t maxr = (XNUDRM_MAX_MSG - sizeof(struct xnudrm_hdr)) / sizeof(*rg);
+	size_t i, n = len >> 12;
+	uint64_t *pa;
+
+	for (i = 0; i < n; i++) (void)*(volatile uint8_t *)((uint8_t *)va + (i << 12));	/* fault every page in */
+	pa = malloc(n * 8);
+	if (!pa) return -ENOMEM;
+	struct xnu_hostcall_xlate x = { (uintptr_t)va, len, (uintptr_t)pa, n };
+	if (ioctl(hc, XNU_HOSTCALL_XLATE, &x)) { int e = -errno; free(pa); return e; }
+	*nr = 0;
+	for (i = 0; i < n; i++) {
+		if (*nr && rg[*nr - 1].pa + rg[*nr - 1].len == pa[i]) { rg[*nr - 1].len += 4096; continue; }
+		if (*nr == maxr) { free(pa); return -E2BIG; }
+		rg[*nr].pa = pa[i]; rg[*nr].len = 4096; ++*nr;
+	}
+	free(pa);
+	return 0;
+}
+
 static int do_map(int fd, uint32_t client, struct xnudrm_hdr *h, uint8_t *out, uint32_t *outlen)
 {
 	struct drm_virtgpu_map m = { .handle = (uint32_t)h->arg0 };
 	size_t len = (h->arg1 + 4095) & ~(size_t)4095;
 	struct xnudrm_range *rg = (void *)out;
-	uint32_t nr = 0, maxr = (XNUDRM_MAX_MSG - sizeof(*h)) / sizeof(*rg);
-	uint64_t *pa;
-	size_t i, n = len >> 12;
-	int id;
+	uint32_t nr = 0;
+	int id, r;
 	void *va;
 
 	if (!len) return -EINVAL;
@@ -145,17 +182,7 @@ static int do_map(int fd, uint32_t client, struct xnudrm_hdr *h, uint8_t *out, u
 	if (ioctl(fd, DRM_IOCTL_VIRTGPU_MAP, &m)) return -errno;
 	va = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, m.offset);
 	if (va == MAP_FAILED) return -errno;
-	for (i = 0; i < n; i++) (void)*(volatile uint8_t *)((uint8_t *)va + (i << 12));	/* fault every page in */
-	pa = malloc(n * 8);
-	if (!pa) { munmap(va, len); return -ENOMEM; }
-	struct xnu_hostcall_xlate x = { (uintptr_t)va, len, (uintptr_t)pa, n };
-	if (ioctl(hc, XNU_HOSTCALL_XLATE, &x)) { int e = -errno; free(pa); munmap(va, len); return e; }
-	for (i = 0; i < n; i++) {
-		if (nr && rg[nr - 1].pa + rg[nr - 1].len == pa[i]) { rg[nr - 1].len += 4096; continue; }
-		if (nr == maxr) { free(pa); munmap(va, len); return -E2BIG; }
-		rg[nr].pa = pa[i]; rg[nr].len = 4096; nr++;
-	}
-	free(pa);
+	if ((r = xnudrmd_ranges(va, len, rg, &nr))) { munmap(va, len); return r; }
 	maps[id] = (struct map){ client, va, len };
 	h->arg0 = id;
 	*outlen = nr * sizeof(*rg);
@@ -187,6 +214,13 @@ static void serve(uint8_t *in, size_t inlen, uint8_t *out, size_t *outlen)
 	}
 	*rh = *h;
 	rh->payload_len = 0;
+#ifdef XNUDRM_VIRGL
+	if (virgl) {
+		vg_serve(h, payload, rh, rpayload, &rlen);
+		st = rh->status;
+		goto out;
+	}
+#endif
 	fd = client_fd(h->client);
 	switch (h->op) {
 	case XNUDRM_OPEN: {
@@ -237,6 +271,9 @@ static void serve(uint8_t *in, size_t inlen, uint8_t *out, size_t *outlen)
 		st = -ENOSYS;
 	}
 	rh->status = st;
+#ifdef XNUDRM_VIRGL
+out:
+#endif
 	rh->payload_len = st == 0 || h->op == XNUDRM_IOCTL ? rlen : 0;
 	*outlen = 8 + sizeof(*rh) + rh->payload_len;
 }
@@ -246,14 +283,27 @@ int main(int argc, char **argv)
 	int a;
 	for (a = 1; a < argc; a++) {
 		if (!strcmp(argv[a], "-v")) verbose++;
+		else if (!strcmp(argv[a], "--virgl")) virgl = 1;
 		else node = argv[a];
 	}
+	if (!virgl) {	/* a render node that is not virtio-gpu: be the virtio-gpu device */
+		char name[32] = "";
+		struct drm_version v = { .name = name, .name_len = sizeof(name) - 1 };
+		int f = open(node, O_RDWR | O_CLOEXEC);
+		if (f >= 0 && !ioctl(f, DRM_IOCTL_VERSION, &v) && strcmp(name, "virtio_gpu")) virgl = 1;
+		if (f >= 0) close(f);
+	}
+#ifdef XNUDRM_VIRGL
+	if (virgl && vg_init()) return 1;
+#else
+	if (virgl) { fprintf(stderr, "xnudrmd: %s is not virtio-gpu, and this build has no virglrenderer backend\n", node); return 1; }
+#endif
 	hc = open("/dev/xnu-hostcall", O_RDWR | O_CLOEXEC);
 	if (hc < 0) { perror("/dev/xnu-hostcall"); return 1; }
 	msg = malloc(8 + XNUDRM_MAX_MSG + sizeof(struct xnudrm_hdr));
 	rep = malloc(8 + XNUDRM_MAX_MSG + sizeof(struct xnudrm_hdr));
 	if (!msg || !rep) return 1;
-	fprintf(stderr, "xnudrmd: serving %s\n", node);
+	fprintf(stderr, "xnudrmd: serving %s\n", virgl ? "virglrenderer (Venus)" : node);
 	for (;;) {
 		ssize_t n = read(hc, msg, 8 + XNUDRM_MAX_MSG + sizeof(struct xnudrm_hdr));
 		size_t rn;

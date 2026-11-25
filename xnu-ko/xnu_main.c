@@ -52,6 +52,7 @@ static signed char linux_cpu_of_slot[LINUX64_CPU_SLOTS];
 static unsigned long long cpu_mpidr[XNU_MAX_CPUS];
 static void *cpu_thread[XNU_MAX_CPUS];
 static volatile int cpu_running[XNU_MAX_CPUS];
+static void stop_commit(void);
 static u64_t a_cpu_entry;			/* XNU's linux64_cpu_entry */
 static inline unsigned this_slot(void) { unsigned long m; __asm__ volatile("mrs %0, mpidr_el1" : "=r"(m)); return LINUX64_CPU_SLOT(m); }
 /* Writing 1 ends the run at XNU's next call into the host; insmod returns and the module can be removed */
@@ -196,6 +197,11 @@ struct boot_args_v2 {			/* pexpert/arm64/boot.h layout */
  */
 static char *model = "VirtualMac2,1";	/* Apple's own virtual Mac's model identifier */
 module_param(model, charp, 0444);
+/* Names for System Information: the chip (/product product-soc-name) and the GPU (the sgx node's "model"). */
+static char *soc_name;
+module_param(soc_name, charp, 0444);
+static char *gpu_model;
+module_param(gpu_model, charp, 0444);
 
 /* the compressor's limit is in VM pages: 6 GB either way */
 static const char *cmdline = "debug=0x8 -v -noprogress serial=0 startup_debug=1";
@@ -415,6 +421,7 @@ static int cpu_fn(void *arg)
 	in_xnu = 0;
 	if (!r) logkv("xnu: linux64_cpu_entry returned (unexpected) on CPU", (u64_t)c);
 	stop_run = 1;			/* one CPU's run ending (a fatal fault, a stop) ends all of them */
+	stop_commit();
 	cpu_running[c] = 0;
 	while (!fki_thread_should_stop())	/* kthread_stop() from the module's exit wants the thread alive */
 		fki_msleep(10);
@@ -436,6 +443,53 @@ static inline void acct_add(unsigned long call, u64_t ticks)
 	unsigned b = acct_bucket(call), s = this_slot();	/* per CPU: no atomics (and none of the compiler's out-of-line ones) */
 	acct_ticks_slot[s][b] += ticks;
 	acct_calls_slot[s][b]++;
+}
+
+/*
+ * Stopping the run: the CPUs leave XNU together. A CPU still inside XNU could otherwise wait for good, interrupts masked,
+ * for one that had already left. Each parks briefly at its host calls; the run is abandoned once all are parked at once.
+ * stop_state: the number of parked CPUs, and STOP_COMMIT once the run is abandoned.
+ */
+#define STOP_COMMIT 0x10000u
+static volatile unsigned stop_state;
+static inline int stop_cas(unsigned old, unsigned new)
+{
+	unsigned cur, fail;
+	__asm__ volatile(
+		"1:	ldaxr	%w[cur], [%[p]]\n"
+		"	cmp	%w[cur], %w[old]\n"
+		"	b.ne	2f\n"
+		"	stlxr	%w[fail], %w[new], [%[p]]\n"
+		"	cbnz	%w[fail], 1b\n"
+		"2:"
+		: [cur] "=&r"(cur), [fail] "=&r"(fail)
+		: [p] "r"(&stop_state), [old] "r"(old), [new] "r"(new)
+		: "cc", "memory");
+	return cur == old;
+}
+static void stop_commit(void)
+{
+	unsigned s;
+	do s = stop_state; while (!(s & STOP_COMMIT) && !stop_cas(s, s | STOP_COMMIT));
+}
+static int stop_park(void)	/* 1: the run is abandoned, do not return to XNU */
+{
+	unsigned s, in_xnu_cpus = 1;
+	u64_t end;
+
+	for (int c = 1; c < cpus; c++)
+		in_xnu_cpus += cpu_running[c] != 0;
+	do {
+		s = stop_state;
+		if (s & STOP_COMMIT) return 1;
+	} while (!stop_cas(s, s + 1));
+	end = fki_counter() + fki_counter_frequency() / 500;	/* 2 ms */
+	for (;;) {
+		s = stop_state;
+		if (s & STOP_COMMIT) return 1;
+		if ((s & (STOP_COMMIT - 1)) >= in_xnu_cpus) { stop_cas(s, s | STOP_COMMIT); continue; }
+		if (fki_counter() > end && stop_cas(s, s - 1)) return 0;
+	}
 }
 
 /* XNU calls into the host: enum linux64_call (linux64_abi.h); a non-zero return ends the run */
@@ -460,7 +514,7 @@ long xnu_hook(unsigned long call, unsigned long a1, unsigned long a2)
 		}
 	}
 	in_xnu = 0;
-	if (*(volatile int *)&stop_run) {	/* the host asked the run to end (scripts/xnulinux-boot.sh stop): XNU is abandoned here */
+	if (*(volatile int *)&stop_run && stop_park()) {	/* the host asked the run to end: XNU is abandoned here */
 		logs("xnu: run stopped by the host (stop_run)");
 		return 1;
 	}
@@ -469,6 +523,12 @@ long xnu_hook(unsigned long call, unsigned long a1, unsigned long a2)
 	long r = xnu_hook_body(call, a1, a2);
 	in_call_slot[in_s] = 0;
 	acct_add(call, fki_counter() - t0);
+	if (r)
+		stop_commit();		/* this CPU ends the run by itself (a panic, a failed assert) */
+	else if (*(volatile int *)&stop_run && stop_park()) {	/* back from a long call when the stop was asked */
+		logs("xnu: run stopped by the host (stop_run)");
+		r = 1;
+	}
 	if (!r) in_xnu = 1;
 	return r;
 }
@@ -646,6 +706,11 @@ static long xnu_hook_body(unsigned long call, unsigned long a1, unsigned long a2
 		logkv("xnu: XNU enters user space (EL0); user pc", a1);
 		return 0;
 	}
+	if (call == LINUX64_CALL_HALT) {		/* shutdown or reboot inside the hosted system */
+		logs(a1 ? "xnu: the hosted system restarts: the run ends (the host starts it again if it is set up to)" :
+		    "xnu: the hosted system halted: the run ends");
+		return 1;
+	}
 	if (call == LINUX64_CALL_PANIC) {
 		char m[500]; const char *f = (const char *)a1; unsigned i = 0;
 		while (f && f[i] && i < sizeof(m) - 1) { m[i] = f[i]; i++; }
@@ -731,7 +796,7 @@ static struct boot_args_v2 *build_boot(unsigned char *base_va, u64_t phys, u64_t
 	logkv("xnu: XNU CPUs", (u64_t)cpus);
 
 	adt_init(&a, base_va + off_dt, 0x40000);
-	adt_node(&a, 3, 6);				/* / */
+	adt_node(&a, 3, 7);				/* / */
 	adt_prop_str(&a, "name", "device-tree");
 	{	/* the platform's own name, then the model: user space's product type (MobileGestalt) comes from this list */
 		static char compat[96];
@@ -829,7 +894,7 @@ static struct boot_args_v2 *build_boot(unsigned char *base_va, u64_t phys, u64_t
 	}
 	adt_node(&a, 1, 0);				/* /defaults: XNU looks these up without checking */
 	adt_prop_str(&a, "name", "defaults");
-	adt_node(&a, 4, 0);				/* /product */
+	adt_node(&a, 4 + (soc_name && soc_name[0] ? 1 : 0), 0);	/* /product */
 	adt_prop_str(&a, "name", "product");
 	/*
 	 * MobileGestalt's product type in sandboxed processes: their profiles let them read only these two /product
@@ -838,6 +903,15 @@ static struct boot_args_v2 *build_boot(unsigned char *base_va, u64_t phys, u64_t
 	adt_prop_str(&a, "sub-product-type", model);
 	adt_prop_str(&a, "unique-model", model);
 	adt_prop_str(&a, "product-name", "xnulinux");
+	if (soc_name && soc_name[0])
+		adt_prop_str(&a, "product-soc-name", soc_name);
+	/* /sgx: System Information describes the GPU from the first child of the service of this name (kexts/XnuCpuMetal) */
+	adt_node(&a, 3 + (gpu_model && gpu_model[0] ? 1 : 0), 0);
+	adt_prop_str(&a, "name", "sgx");
+	adt_prop_str(&a, "device_type", "sgx");
+	adt_prop_str(&a, "compatible", "xnulinux,gpu");
+	if (gpu_model && gpu_model[0])
+		adt_prop_str(&a, "model", gpu_model);
 	adt_node(&a, 1, 0);				/* /options: NVRAM's node (AppleImage4 keeps its nonce seeds there) */
 	adt_prop_str(&a, "name", "options");
 	adt_node(&a, 3, FB_SIZE ? 1 : 0);		/* /arm-io: XNU needs a nonzero SoC base */
@@ -900,6 +974,18 @@ static struct boot_args_v2 *build_boot(unsigned char *base_va, u64_t phys, u64_t
 	if (rd_size || hd_file) {
 		const char *rd = " rd=md0";
 		x_memcpy(ba->CommandLine + x_strlen(ba->CommandLine), rd, x_strlen(rd) + 1);
+	}
+	{
+		/*
+		 * Apple's user space assumes a 24 MHz timebase (libswift_Concurrency: ticks = ns * 3 / 125) and XNU's machine
+		 * timeouts are in those ticks: on another counter rate the kernel scales the counter (droidvm-timebase-hz).
+		 * The debugger's cross-call gets 1 s, not 10 ms: a CPU may be inside a host call when asked to stop.
+		 */
+		const char *a = fki_counter_frequency() != 24000000 ?
+		    " ml-timeout-debug-ack-scale=100 droidvm-timebase-hz=24000000" : " ml-timeout-debug-ack-scale=100";
+
+		if (x_strlen(ba->CommandLine) + x_strlen(a) < sizeof(ba->CommandLine))
+			x_memcpy(ba->CommandLine + x_strlen(ba->CommandLine), a, x_strlen(a) + 1);
 	}
 	if (bootargs && x_strlen(ba->CommandLine) + 1 + x_strlen(bootargs) < sizeof(ba->CommandLine)) {
 		char *e = ba->CommandLine + x_strlen(ba->CommandLine);
@@ -1144,6 +1230,7 @@ static int enter_arm_init(struct boot_args_v2 *ba)
 	long r = xnu_world_call(a_init, (unsigned long)ba);
 	in_xnu = 0;
 	stop_run = 1;		/* the other CPUs end at their next call into the host (kicked out of idle) */
+	stop_commit();
 	for (int c = 1; c < cpus; c++) {
 		for (int t = 0; cpu_running[c] && t < 500; t++) { fki_kick_cpu(c); fki_msleep(10); }
 		if (cpu_running[c]) logkv("xnu: CPU did not leave XNU in 5 s:", (u64_t)c);

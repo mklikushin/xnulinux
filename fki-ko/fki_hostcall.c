@@ -8,7 +8,8 @@
  * One call at a time. The calling foreign CPU is blocked in the call and deaf to the other foreign CPUs' interrupts, so
  * a call with no service to answer it fails at once (-ENODEV), not after HC_TIMEOUT: the other CPUs would time out
  * waiting on that one (an XNU panic). The service also asks fki to translate its own mappings into physical addresses
- * (XNU_HOSTCALL_XLATE), so the foreign kernel can map the same pages.
+ * (XNU_HOSTCALL_XLATE), so the foreign kernel can map the same pages. Pages nothing else holds in place (shared memory,
+ * not a driver's buffer) it pins first (XNU_HOSTCALL_PIN), until XNU_HOSTCALL_UNPIN or its close.
  */
 #include "fki.h"
 #include "fki_internal.h"
@@ -32,6 +33,15 @@ struct xnu_hostcall_xlate {
 	__u64 max;			/* entries at out */
 };
 #define XNU_HOSTCALL_XLATE _IOWR('X', 1, struct xnu_hostcall_xlate)
+struct xnu_hostcall_range {
+	__u64 va, len;			/* 4 KiB aligned; UNPIN: the va of a PIN (len unused) */
+};
+#define XNU_HOSTCALL_PIN _IOW('X', 2, struct xnu_hostcall_range)
+#define XNU_HOSTCALL_UNPIN _IOW('X', 3, struct xnu_hostcall_range)
+#define HC_PIN_MAX ((1UL << 30) >> PAGE_SHIFT)
+
+struct hc_pin { struct list_head link; unsigned long va, n; struct page **pages; };
+struct hc_file { struct mutex lock; struct list_head pins; };
 
 static DECLARE_WAIT_QUEUE_HEAD(hc_req_wait);
 static DECLARE_WAIT_QUEUE_HEAD(hc_done_wait);
@@ -212,15 +222,79 @@ static long hc_xlate(struct xnu_hostcall_xlate __user *ua)
 	return err;
 }
 
+static void hc_pin_free(struct hc_pin *p)
+{
+	unpin_user_pages(p->pages, p->n);
+	kvfree(p->pages);
+	kfree(p);
+}
+
+static long hc_pin(struct hc_file *hf, unsigned int cmd, struct xnu_hostcall_range __user *ua)
+{
+	struct xnu_hostcall_range a;
+	struct hc_pin *p, *found = NULL;
+	long got;
+
+	if (copy_from_user(&a, ua, sizeof(a)))
+		return -EFAULT;
+	if (cmd == XNU_HOSTCALL_UNPIN) {
+		mutex_lock(&hf->lock);
+		list_for_each_entry(p, &hf->pins, link)
+			if (p->va == a.va) {
+				found = p;
+				list_del(&p->link);
+				break;
+			}
+		mutex_unlock(&hf->lock);
+		if (!found)
+			return -ENOENT;
+		hc_pin_free(found);
+		return 0;
+	}
+	if (((a.va | a.len) & (PAGE_SIZE - 1)) || !a.len || (a.len >> PAGE_SHIFT) > HC_PIN_MAX)
+		return -EINVAL;
+	p = kzalloc(sizeof(*p), GFP_KERNEL);
+	if (!p)
+		return -ENOMEM;
+	p->va = a.va;
+	p->n = a.len >> PAGE_SHIFT;
+	p->pages = kvmalloc_array(p->n, sizeof(*p->pages), GFP_KERNEL);
+	if (!p->pages) {
+		kfree(p);
+		return -ENOMEM;
+	}
+	got = pin_user_pages_fast(p->va, p->n, FOLL_WRITE | FOLL_LONGTERM, p->pages);
+	if (got != p->n) {
+		if (got > 0)
+			unpin_user_pages(p->pages, got);
+		kvfree(p->pages);
+		kfree(p);
+		return got < 0 ? got : -EFAULT;
+	}
+	mutex_lock(&hf->lock);
+	list_add(&p->link, &hf->pins);
+	mutex_unlock(&hf->lock);
+	return 0;
+}
+
 static long hc_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
 	if (cmd == XNU_HOSTCALL_XLATE)
 		return hc_xlate((struct xnu_hostcall_xlate __user *)arg);
+	if (cmd == XNU_HOSTCALL_PIN || cmd == XNU_HOSTCALL_UNPIN)
+		return hc_pin(f->private_data, cmd, (struct xnu_hostcall_range __user *)arg);
 	return -ENOTTY;
 }
 
 static int hc_dev_open(struct inode *i, struct file *f)
 {
+	struct hc_file *hf = kzalloc(sizeof(*hf), GFP_KERNEL);
+
+	if (!hf)
+		return -ENOMEM;
+	mutex_init(&hf->lock);
+	INIT_LIST_HEAD(&hf->pins);
+	f->private_data = hf;
 	spin_lock(&hc_lock);
 	hc_open++;
 	spin_unlock(&hc_lock);
@@ -229,6 +303,12 @@ static int hc_dev_open(struct inode *i, struct file *f)
 
 static int hc_dev_release(struct inode *i, struct file *f)
 {
+	struct hc_file *hf = f->private_data;
+	struct hc_pin *p, *next;
+
+	list_for_each_entry_safe(p, next, &hf->pins, link)
+		hc_pin_free(p);
+	kfree(hf);
 	spin_lock(&hc_lock);
 	hc_open--;
 	spin_unlock(&hc_lock);

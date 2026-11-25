@@ -31,7 +31,7 @@ constexpr IOByteCount kBounce = 1024 * 1024; // the largest piece one upcall mov
 
 class XnuDisk : public IOBlockStorageDevice {
     OSDeclareDefaultStructors(XnuDisk)
-    UInt64 fBlocks = 0;
+    UInt64 fBlocks = 0, fBlockSize = kBlockSize;
     IOLock *fLock = nullptr;
     uint8_t *fBounce = nullptr;
     char fVendor[8] = "Apple", fProduct[24] = "xnulinux Disk", fRevision[8] = "1.0", fInfo[4] = "";
@@ -45,14 +45,14 @@ public:
     UInt32 doGetFormatCapacities(UInt64 *capacities, UInt32 max) const override
     {
         if (capacities && max)
-            capacities[0] = fBlocks * kBlockSize;
+            capacities[0] = fBlocks * fBlockSize;
         return 1;
     }
     char *getVendorString() override { return fVendor; }
     char *getProductString() override { return fProduct; }
     char *getRevisionString() override { return fRevision; }
     char *getAdditionalDeviceInfoString() override { return fInfo; }
-    IOReturn reportBlockSize(UInt64 *size) override { *size = kBlockSize; return kIOReturnSuccess; }
+    IOReturn reportBlockSize(UInt64 *size) override { *size = fBlockSize; return kIOReturnSuccess; }
     IOReturn reportEjectability(bool *ejectable) override { *ejectable = false; return kIOReturnSuccess; }
     IOReturn reportMaxValidBlock(UInt64 *block) override { *block = fBlocks - 1; return kIOReturnSuccess; }
     IOReturn reportMediaState(bool *present, bool *changed) override
@@ -76,13 +76,17 @@ OSDefineMetaClassAndStructors(XnuDisk, IOBlockStorageDevice)
 bool XnuDisk::start(IOService *provider)
 {
     UInt64 bytes = linux64_disk_size();
-    if (bytes < kBlockSize || !IOBlockStorageDevice::start(provider))
+    if (bytes < 2 * 4096 || !IOBlockStorageDevice::start(provider))
         return false;
-    fBlocks = bytes / kBlockSize;
     fLock = IOLockAlloc();
     fBounce = (uint8_t *)IOMallocData(kBounce);
     if (!fLock || !fBounce)
         return false;
+    // ... or 4096, when the GPT header (LBA 1) is at byte 4096 and not at 512
+    if (linux64_disk_rw(0, fBounce, 8, 4096) == 8 && !memcmp(fBounce, "EFI PART", 8) &&
+        !(linux64_disk_rw(0, fBounce, 8, 512) == 8 && !memcmp(fBounce, "EFI PART", 8)))
+        fBlockSize = 4096;
+    fBlocks = bytes / fBlockSize;
     // an internal disk, as the Mac's own: APFS and the system treat the container on it as the boot disk's
     OSDictionary *protocol = OSDictionary::withCapacity(2);
     OSDictionary *device = OSDictionary::withCapacity(2);
@@ -120,7 +124,7 @@ bool XnuDisk::start(IOService *provider)
         release();
         registerService();
     }
-    IOLog("XnuDisk: %llu blocks of %llu bytes (%llu MB)\n", fBlocks, kBlockSize, bytes >> 20);
+    IOLog("XnuDisk: %llu blocks of %llu bytes (%llu MB)\n", fBlocks, fBlockSize, bytes >> 20);
     return true;
 }
 
@@ -152,7 +156,7 @@ IOReturn XnuDisk::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, UIn
     if (!buffer || block + nblks > fBlocks)
         return kIOReturnBadArgument;
     bool write = buffer->getDirection() == kIODirectionOut;
-    IOByteCount total = nblks * kBlockSize, done = 0;
+    IOByteCount total = nblks * fBlockSize, done = 0;
     IOReturn status = buffer->prepare();
     if (status == kIOReturnSuccess) {
         IOLockLock(fLock);
@@ -162,10 +166,10 @@ IOReturn XnuDisk::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, UIn
                 status = kIOReturnIOError;
                 break;
             }
-            long moved = linux64_disk_rw(write, fBounce, piece, block * kBlockSize + done);
+            long moved = linux64_disk_rw(write, fBounce, piece, block * fBlockSize + done);
             if (moved != (long)piece) {
                 IOLog("XnuDisk: %s of %llu bytes at block %llu failed (%ld)\n", write ? "write" : "read", (UInt64)piece,
-                      block + done / kBlockSize, moved);
+                      block + done / fBlockSize, moved);
                 status = kIOReturnIOError;
                 break;
             }

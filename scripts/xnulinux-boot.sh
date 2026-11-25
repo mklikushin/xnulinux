@@ -18,7 +18,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 if [ "${1:-}" = stop ]; then	# end the running hosted system (its disk synced first) and remove xnu.ko
-  if ! lsmod | grep -q '^xnu '; then
+  if [ ! -d /sys/module/xnu ]; then
     sudo systemctl stop xnudrmd 2>/dev/null || true
     echo "no hosted system is running"; exit 0
   fi
@@ -26,7 +26,7 @@ if [ "${1:-}" = stop ]; then	# end the running hosted system (its disk synced fi
   echo 1 | sudo tee /sys/module/xnu/parameters/stop_run >/dev/null
   # every XNU CPU sees the stop at its next host call; one in a long one (disk I/O while the VM shuts down) takes a while
   for _ in $(seq 1 600); do pgrep -f "insmod xnu-ko/xnu.ko" >/dev/null || break; sleep 0.2; done
-  if lsmod | grep -q '^xnu '; then sudo rmmod xnu; fi
+  if [ -d /sys/module/xnu ]; then sudo rmmod xnu; fi
   sudo systemctl stop xnudrmd 2>/dev/null || true
   echo "hosted system stopped"
   exit
@@ -39,7 +39,7 @@ CONSOLE_IN=${CONSOLE_IN:-/var/tmp/console-in}; INPUT_IN=${INPUT_IN:-/var/tmp/xnu
 KEYSTORE=${KEYSTORE:-/var/tmp/xnu-keystore.bin}; TRUSTCACHE=${TRUSTCACHE:-xnu/trustcache-mac.bin}; IMAGE=${IMAGE:-xnu/kc.bin}
 BOOTARGS=${BOOTARGS:-amfi_get_out_of_my_way=1 lp-sip0=2050}
 : "${ROOT_UUID:?no ROOT_UUID (/var/tmp/mac.conf from mk-macvm-disk.sh)}" "${BOOT_UUID:?no BOOT_UUID}"
-lsmod | grep -q '^xnu ' && { echo "xnu.ko is loaded: a hosted system is running (sudo rmmod xnu first)" >&2; exit 1; }
+[ -d /sys/module/xnu ] && { echo "xnu.ko is loaded: a hosted system is running (sudo rmmod xnu first)" >&2; exit 1; }
 
 K=/lib/modules/$(uname -r)/build
 build() {	# a module; its compiler errors on failure
@@ -73,7 +73,13 @@ rm -f "$KEYSTORE"; truncate -s 1M "$KEYSTORE"	# fresh each boot, as the disk was
 # for another's I/O can wait for good (as a hypervisor keeps device interrupts off its vCPUs' cores).
 NCPU=$(nproc --all)
 if [ "$NCPU" -gt "$CPUS" ]; then
-  MASK=$(python3 -c "print(format(((1 << $NCPU) - 1) & ~((1 << $CPUS) - 1), 'x'))")
+  # XNU's CPUs: Linux CPUs 0..CPUS-1, or the first CPUS of fki's cpu_list
+  XCPUS=$(cat /sys/module/fki/parameters/cpu_list 2>/dev/null | tr -d '\n')
+  MASK=$(python3 -c "
+l = [int(c) for c in '$XCPUS'.split(',') if c][:$CPUS] or list(range($CPUS))
+m = (1 << $NCPU) - 1
+for c in l: m &= ~(1 << c)
+print(format(m, 'x'))")
   echo "$MASK" | sudo tee /proc/irq/default_smp_affinity >/dev/null 2>&1 || true
   for f in /proc/irq/*/smp_affinity; do echo "$MASK" | sudo tee "$f" >/dev/null 2>&1 || true; done
 fi
@@ -88,7 +94,7 @@ if [ "$GPU" != off ] && [ -e /dev/dri/renderD128 ]; then
   DRM_READY=0
   DRM_INV=$(systemctl show -p InvocationID --value xnudrmd 2>/dev/null || true)
   for _ in $(seq 1 100); do
-    if [ -n "$DRM_INV" ] && sudo journalctl _SYSTEMD_INVOCATION_ID="$DRM_INV" -q --no-pager 2>/dev/null | grep -q "xnudrmd: serving"; then
+    if [ -n "$DRM_INV" ] && sudo journalctl _SYSTEMD_INVOCATION_ID="$DRM_INV" -q --no-pager 2>/dev/null | grep "xnudrmd: serving" >/dev/null; then
       DRM_READY=1; break
     fi
     DRM_STATE=$(systemctl show -p ActiveState --value xnudrmd 2>/dev/null || true)
@@ -97,11 +103,19 @@ if [ "$GPU" != off ] && [ -e /dev/dri/renderD128 ]; then
   done
   if [ "$DRM_READY" = 1 ]; then
     echo "gpu: xnudrmd ready on /dev/dri/renderD128 (journalctl -u xnudrmd)"
+    # GPU name for System Information (override: GPU_MODEL=)
+    GPU_MODEL=${GPU_MODEL:-$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)}
   else
     echo "gpu: xnudrmd did not become ready within 10 s (journalctl -u xnudrmd); continuing with GPU=off" >&2
     sudo systemctl stop xnudrmd 2>/dev/null || true
   fi
 fi
+# Chip name for System Information (override: SOC_NAME=)
+XCPU0=$(cat /sys/module/fki/parameters/cpu_list 2>/dev/null | tr -d '\n' | cut -d, -f1); XCPU0=${XCPU0:-0}
+SOC_NAME=${SOC_NAME:-$(lscpu -e=CPU,MODELNAME 2>/dev/null | awk -v c="$XCPU0" '$1 == c { $1 = ""; sub(/^ +/, ""); print }' || true)}
+NAMES=()
+[ -n "${SOC_NAME:-}" ] && NAMES+=("soc_name=\"$SOC_NAME\"")
+[ -n "${GPU_MODEL:-}" ] && NAMES+=("gpu_model=\"$GPU_MODEL\"")
 # mode=3: the kernel collection; the run lasts until the hosted system halts.
 # insmod returns when the run ends: it runs detached, its output in /var/tmp/xnu-insmod.log.
 START=$(date +%s)	# the run's log (--wait) starts here, so a failure while xnu.ko loads is in it
@@ -110,15 +124,15 @@ for try in 1 2 3 4 5 6 7 8 9; do
   sudo dmesg -C
   sudo setsid nohup insmod xnu-ko/xnu.ko mode=3 cpus="$CPUS" ram_mb="$RAM_MB" image="$IMAGE" \
     trustcache="$TRUSTCACHE" disk="$DISK" root_uuid="$ROOT_UUID" boot_uuid="$BOOT_UUID" preboot_uuid="$BOOT_UUID" \
-    console_in="$CONSOLE_IN" input_in="$INPUT_IN" fb_dump="$FB_DUMP" keystore="$KEYSTORE" bootargs="\"$BOOTARGS\"" ${XNU_ARGS:-} \
+    console_in="$CONSOLE_IN" input_in="$INPUT_IN" fb_dump="$FB_DUMP" keystore="$KEYSTORE" bootargs="\"$BOOTARGS\"" "${NAMES[@]}" ${XNU_ARGS:-} \
     > /var/tmp/xnu-insmod.log 2>&1 < /dev/null &
   sleep 5
-  if sudo dmesg | grep -aqE "fki: carve-out .* (overlaps|is not all RAM)"; then	# a configuration error: no retry
+  if sudo dmesg | grep -aE "fki: carve-out .* (overlaps|is not all RAM)" >/dev/null; then	# a configuration error: no retry
     sudo dmesg | grep -aE "fki: carve-out .* (overlaps|is not all RAM)" >&2
     sudo systemctl stop xnudrmd 2>/dev/null || true
     exit 1
   fi
-  sudo dmesg | grep -aq "contiguous allocation failed" || break
+  sudo dmesg | grep -a "contiguous allocation failed" >/dev/null || break
   if [ $try = 9 ]; then
     echo "no contiguous memory for XNU (CMA: $(grep CmaFree /proc/meminfo))" >&2
     sudo systemctl stop xnudrmd 2>/dev/null || true
@@ -135,7 +149,7 @@ collect() {	# the run's kernel log, kept; the status says how it ended
   local LOGDIR=/var/log/xnulinux LOG
   # insmod has returned but xnu.ko stays loaded after a run that ended by itself (a panic, a halt): unload it, or the
   # next start (systemd's restart after a panic) finds it and refuses
-  if lsmod | grep -q '^xnu '; then sudo rmmod xnu || echo "xnu.ko did not unload" >&2; fi
+  if [ -d /sys/module/xnu ]; then sudo rmmod xnu || echo "xnu.ko did not unload" >&2; fi
   sudo systemctl stop xnudrmd 2>/dev/null || true
   sudo mkdir -p "$LOGDIR"
   LOG=$LOGDIR/run-$(date -d @"$START" +%Y%m%d-%H%M%S).log
@@ -143,6 +157,7 @@ collect() {	# the run's kernel log, kept; the status says how it ended
     sudo tee "$LOG" >/dev/null
   ls -1t "$LOGDIR"/run-*.log | tail -n +21 | xargs -r sudo rm -f	# the last 20 runs
   if grep -aq "XNU panic" "$LOG"; then echo "the hosted system panicked: $LOG" >&2; return 2; fi
+  if grep -aq "the hosted system halted\|the hosted system restarts" "$LOG"; then echo "the hosted system halted: $LOG"; return 0; fi
   if [ "${1:-}" = stopped ] || grep -aq "run stopped by the host" "$LOG"; then echo "the hosted system stopped: $LOG"; return 0; fi
   echo "the run ended: $LOG" >&2; return 3
 }

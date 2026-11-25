@@ -48,7 +48,10 @@ What the PoC did to get each step running, and what replaces it. Ordered by what
 The DRM bridge: a Mesa Vulkan driver built for Darwin runs in the macOS process; its DRM calls go to an IOKit user client
 (`kexts/XnuDrm`) and through FKI to the Linux DRM device. Buffer objects are Linux pages mapped straight into the macOS task
 (same physical memory, no copies). On an Apple Silicon host the Linux DRM device is virtio-gpu with Venus (krunkit:
-Venus → MoltenVK → Metal on the host GPU); on a Linux machine with its own GPU it is that GPU's driver.
+Venus → MoltenVK → Metal on the host GPU). On a Linux machine with its own GPU there is no virtio-gpu: `xnudrmd` is the
+virtio-gpu device itself, serving the same client from virglrenderer's Venus on the machine's Vulkan driver
+(`gpu/xnu-drm/xnudrmd_virgl.c`). On a DGX Spark the hosted macOS gets `Virtio-GPU Venus (NVIDIA GB10)`: the compute
+test and a Metal compute kernel read back correct results and WindowServer composites through it (not yet measured).
 
 ### Status of the bridge
 

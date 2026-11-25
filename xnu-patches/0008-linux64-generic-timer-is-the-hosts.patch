@@ -1,0 +1,25 @@
+From: xnulinux
+Subject: [PATCH] linux64: the generic timer is the host's from the first CPU init
+
+fiq_context_init enabled the virtual timer and masked the physical one on every CPU. Hosted, both are Linux's
+(ml_set_decrementer already leaves them alone), and a hypervisor need not let EL1 at the physical timer: Hyper-V
+(Azure's arm64 VMs) traps CNTP_CTL_EL0 and injects an undefined instruction, which ended the run in arm_init.
+---
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -2796,6 +2796,14 @@ _enable_virtual_timer(void)
+ {
+ 	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE; /* One wants to use 32 bits, but "mrs" prefers it this way */
+ 
++	/*
++	 * LINUX64 (xnulinux): hosted, the generic timer is Linux's (ml_set_decrementer leaves it alone too), and a
++	 * hypervisor may not let EL1 touch the physical timer at all: Hyper-V (Azure) traps CNTP_CTL_EL0 and injects an
++	 * undefined instruction.
++	 */
++	if (linux64_hook) {
++		return;
++	}
+ 	__builtin_arm_wsr64(KERNEL_CNTV_CTL_EL0, cntvctl);
+ #if !defined(XNU_VIRTUAL_TIMER_ONLY) || !XNU_VIRTUAL_TIMER_ONLY
+ 	/* disable the physical timer as a precaution, as its registers reset to architecturally unknown values */

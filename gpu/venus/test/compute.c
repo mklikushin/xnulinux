@@ -86,8 +86,14 @@ int main(int argc,char**argv){
   load_global();
   CK(vkCreateInstance(&ic,0,&inst));
   load_instance(inst);
-  uint32_t n=1; VkPhysicalDevice pd; CK(vkEnumeratePhysicalDevices(inst,&n,&pd));
-  VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(pd,&pp); printf("device: %s\n",pp.deviceName);
+  /* the first device that is not a CPU, or VT_DEVICE=n */
+  uint32_t n=8, pick=0; VkPhysicalDevice pds[8], pd; VkPhysicalDeviceProperties pp;
+  VkResult er=vkEnumeratePhysicalDevices(inst,&n,pds);
+  if((er!=VK_SUCCESS&&er!=VK_INCOMPLETE)||!n){ printf("FAIL vkEnumeratePhysicalDevices = %d, %u devices\n",er,n); return 1; }
+  for(uint32_t i=0;i<n;i++){ vkGetPhysicalDeviceProperties(pds[i],&pp); printf("device %u: %s (type %d)\n",i,pp.deviceName,pp.deviceType); }
+  for(uint32_t i=n;i-->0;){ vkGetPhysicalDeviceProperties(pds[i],&pp); if(pp.deviceType!=VK_PHYSICAL_DEVICE_TYPE_CPU) pick=i; }
+  if(getenv("VT_DEVICE")) pick=(uint32_t)atoi(getenv("VT_DEVICE"))%n;
+  pd=pds[pick]; vkGetPhysicalDeviceProperties(pd,&pp); printf("device: %s\n",pp.deviceName);
   float pr=1; VkDeviceQueueCreateInfo qc={VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,0,0,0,1,&pr};
   VkDeviceCreateInfo dc={VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,0,0,1,&qc};
   VkDevice dev; CK(vkCreateDevice(pd,&dc,0,&dev)); VkQueue q; vkGetDeviceQueue(dev,0,0,&q);

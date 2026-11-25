@@ -28,18 +28,31 @@ if k in s and 'aarch64-linux-gnu' not in s:
     s=s.replace(k, k.replace("'\\n'.join(lines)", "'\\n'.join(lines).replace('x86_64-linux-gnu', 'aarch64-linux-gnu')"))
     open(p,'w').write(s)
 PY
-# cctools' foreign mach/machine headers know x86 only; host tools (kextsymboltool, ...) only need LP64 types
-for f in $(grep -rl -E 'defined *\(__x86_64__\)' toolchains/linux/cctools-work/cctools/include/foreign); do
-  grep -q __aarch64__ $f || sed -i 's/defined *(__x86_64__)/defined(__x86_64__) || defined(__aarch64__)/g' $f
-done
-T=toolchains/linux/cctools-work/cctools/include/foreign/mach/thread_status.h
-grep -q 'xnupoc' $T || sed -i 's|^typedef\tnatural_t\tthread_state_data_t\[THREAD_STATE_MAX\];|#ifndef THREAD_STATE_MAX /* xnupoc: aarch64 host */\n#define THREAD_STATE_MAX 144\n#endif\n&|' $T
-grep -n -B3 'thread_state_data_t\[' $T
+# cctools' foreign mach/machine headers know x86 only; host tools (kextsymboltool, ...) only need LP64 types.
+# Patched once the toolchain step has fetched them.
+patch_cctools() {
+  local d f T
+  for d in $(find toolchains -type d -path '*/cctools/include/foreign' 2>/dev/null); do
+    for f in $(grep -rl -E 'defined *\(__x86_64__\)' "$d"); do
+      grep -q __aarch64__ "$f" || sed -i 's/defined *(__x86_64__)/defined(__x86_64__) || defined(__aarch64__)/g' "$f"
+    done
+    T=$d/mach/thread_status.h
+    grep -q 'xnupoc' "$T" || sed -i 's|^typedef\tnatural_t\tthread_state_data_t\[THREAD_STATE_MAX\];|#ifndef THREAD_STATE_MAX /* xnupoc: aarch64 host */\n#define THREAD_STATE_MAX 144\n#endif\n&|' "$T"
+    grep -n -B3 'thread_state_data_t\[' "$T"
+  done
+}
 python3 scripts/setup-env.py toolchain --jobs 12
-# decomment keeps getc() in a char: EOF never matches where char is unsigned (aarch64) and it spins forever
+patch_cctools
+# decomment keeps getc() in a char: EOF never matches where char is unsigned (aarch64) and it spins forever, writing until
+# the disk is full. `setup-env.py x12377` makes the tree (out/k27/xnu) and runs decomment (installhdrs) in one go, so on a
+# fresh checkout the tree is made first on its own and patched before that step.
+[ -d out/k27/xnu ] || python3 -c "
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location('setup_env', 'scripts/setup-env.py'); m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m); m.kernel_tree()"
 D=out/k27/xnu/SETUP/decomment/decomment.c
-[ -f $D ] && sed -i 's/^\tchar bufchar;/\tint bufchar;/' $D && grep -n 'bufchar;' $D && rm -f out/x12377/build/xnu/hdrs-obj/SETUP/decomment/decomment
-pkill -x decomment || true
+test -f $D
+sed -i 's/^\tchar bufchar;/\tint bufchar;/' $D && grep -n 'int bufchar;' $D && rm -f out/x12377/build/xnu/hdrs-obj/SETUP/decomment/decomment
 # libclang_rt.cc_kext comes from the CLTools package (unpacked only; Darling is not needed for it)
 A=toolchains/linux/appleclang; mkdir -p $A
 python3 compat/xnu-linux/scripts/setup-appleclang.py fetch --directory $A

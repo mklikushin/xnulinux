@@ -1,0 +1,7 @@
+# sershell.py helper/serial.sock 1-cryptex.cmds --wait-boot   (helper guest: hboot.sh, SIP off, the target disk attached)
+B=$(mount | awk '$3=="/"{print $1}' | sed 's|/dev/\(disk[0-9]*\).*|\1|'); A=/System/Library/Filesystems/apfs.fs/Contents/Resources/apfs.util; for d in /dev/disk[0-9]s[0-9]; do case $d in /dev/${B}s*) continue;; esac; n=$($A -p $d 2>/dev/null | head -1); case "$n" in "Macintosh HD") TSYS=$d;; Preboot) TPRE=$d;; esac; done; echo "sys=$TSYS pre=$TPRE"; P=/System/Volumes/VM; Y=/System/Volumes/Update
+mount -t apfs -o rw,nobrowse $TPRE $P >/dev/null 2>&1; mount -t apfs -o rw,nobrowse $TSYS $Y >/dev/null 2>&1; mount | grep -c -E "Volumes/(VM|Update)"
+@2400 rm -rf $P/Cryptexes/OS $P/Cryptexes/App; mkdir -p $P/Cryptexes/OS $P/Cryptexes/App && ditto /System/Cryptexes/OS/ $P/Cryptexes/OS >/dev/null 2>&1; echo ditto-os=$?; ditto /System/Cryptexes/App/ $P/Cryptexes/App >/dev/null 2>&1; echo ditto-app=$?
+@1200 C=/System/Cryptexes/OS; for d in usr/lib usr/libexec usr/bin usr/sbin usr/share System/iOSSupport; do [ -d $C/$d ] && mkdir -p $Y/$d && cp -Rpn $C/$d/. $Y/$d/ 2>/dev/null; done; echo merged-usr
+@1200 C=/System/Cryptexes/OS; for e in $C/System/Library/*; do n=$(basename "$e"); [ "$n" = dyld ] && continue; if [ -d "$e" ]; then mkdir -p "$Y/System/Library/$n"; cp -Rpn "$e/." "$Y/System/Library/$n/" 2>/dev/null; else cp -pn "$e" "$Y/System/Library/" 2>/dev/null; fi; done; ls -la $Y/usr/lib/libLaunchServicesSupport.dylib
+sync; umount $Y; umount $P; sync; mount | grep -c -E "Volumes/(VM|Update)"; echo CRYPTEX_DONE
