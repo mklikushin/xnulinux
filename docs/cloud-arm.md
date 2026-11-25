@@ -710,6 +710,23 @@ the VM by DHCP; the tools look it up.
   Then connect to `vnc://localhost:5900` as `xnu`. The server offers only Apple's authentication types, so a generic
   VNC client will not connect. Only the protocol handshake was checked here, not a full session.
 
+### Screen capture and scripting over ssh
+
+A program started from an ssh session cannot capture the screen (`screencapture`: "could not create image from display")
+and its Apple events wait behind a consent dialog on the hosted screen (`"sshd-keygen-wrapper" wants access to control
+"Finder"`). `tools/hosted/grant-automation.sh`, run once as root in the guest after the first login, writes the grants
+(screen capture, accessibility, input events, and Apple events to Finder, System Events, Terminal, Safari and Chrome):
+
+```sh
+tools/cloud/guest-ssh 'cat > /tmp/grant.sh' < tools/hosted/grant-automation.sh
+tools/cloud/guest-ssh 'echo PASSWORD | sudo -S sh /tmp/grant.sh'
+```
+
+Check: `screencapture -x /tmp/s.png` writes a 1280x800 image, and
+`osascript -e 'tell application "Finder" to get name of startup disk'` prints `Macintosh HD` at once. Its header says how
+to grant other programs and targets and how to take the grants out again. Tested on a Mac-built disk (macOS 27.2.1) on a
+Google Cloud C4A VM: denied before, both working after, denied again after `REVOKE=1`.
+
 ## 12. Tuning for CPU rendering
 
 With `GPU=off` the window server alone takes about one CPU while the screen is changing. These changes were applied
