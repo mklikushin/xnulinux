@@ -42,8 +42,12 @@ static int quiet_line(const char *l, unsigned n)
 		if (!x_strncmp(l + k, "triggered unnest", 16)) return 1;
 	return 0;
 }
-/* XNU's CPUs: Linux CPUs 0 .. cpus-1 (XNU's CPU 0 is Linux CPU 0, where xnu.ko's loading task runs) */
-#define XNU_MAX_CPUS 16
+/*
+ * XNU's CPUs: Linux CPUs 0 .. cpus-1 (XNU's CPU 0 is Linux CPU 0, where xnu.ko's loading task runs). No more than
+ * XNU's own tables hold (LINUX64_MAX_CPUS): XNU faulted registering a CPU beyond them (12 asked of a kernel built for
+ * 8: ml_processor_register read the ninth entry of an eight-entry table).
+ */
+#define XNU_MAX_CPUS LINUX64_MAX_CPUS
 static int cpus = 1;
 module_param(cpus, int, 0444);
 static struct xnu_world worlds[XNU_MAX_CPUS];		/* worlds[0] is xnu_W's twin: see xnu_worlds */
@@ -785,7 +789,10 @@ static struct boot_args_v2 *build_boot(unsigned char *base_va, u64_t phys, u64_t
 	int berr = fki_bind_cpu(0);
 	if (berr) { logkv("xnu: cannot bind to cpu0, err", (u64_t)berr); return 0; }
 	if (cpus < 1) cpus = 1;
-	if (cpus > XNU_MAX_CPUS) cpus = XNU_MAX_CPUS;
+	if (cpus > XNU_MAX_CPUS) {
+		logkv("xnu: more CPUs asked for than XNU is built for, using", (u64_t)XNU_MAX_CPUS);
+		cpus = XNU_MAX_CPUS;
+	}
 	if (cpus > fki_num_cpus()) cpus = fki_num_cpus();
 	for (int i = 0; i < LINUX64_CPU_SLOTS; i++) linux_cpu_of_slot[i] = -1;
 	for (int c = 0; c < cpus; c++) {
@@ -891,7 +898,7 @@ static struct boot_args_v2 *build_boot(unsigned char *base_va, u64_t phys, u64_t
 	for (int c = 0; c < cpus; c++) {	/* compatible: kexts/XnuCPU registers each with XNU and starts it */
 		static char cname[XNU_MAX_CPUS][8];
 		cname[c][0] = 'c'; cname[c][1] = 'p'; cname[c][2] = 'u';
-		if (c < 10) { cname[c][3] = '0' + c; cname[c][4] = 0; } else { cname[c][3] = '1'; cname[c][4] = '0' + c - 10; cname[c][5] = 0; }
+		if (c < 10) { cname[c][3] = '0' + c; cname[c][4] = 0; } else { cname[c][3] = '0' + c / 10; cname[c][4] = '0' + c % 10; cname[c][5] = 0; }
 		adt_node(&a, 6, 0);
 		adt_prop_str(&a, "name", cname[c]);
 		adt_prop_str(&a, "compatible", "xnulinux,cpu");

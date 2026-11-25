@@ -98,12 +98,20 @@ struct linux64_input_event {
 #define LINUX64_CPU_SLOT(mpidr) ((unsigned)(((mpidr) & 0xf) | (((mpidr) >> 4) & 0xf0)))
 
 /*
+ * The most CPUs the hosted system can have: the size of XNU's per-CPU tables on the virtual board (MAX_CPUS in
+ * pexpert's board_config.h, which xnu-patches/0010 sets and osfmk/arm64/machine_routines.c checks against this) and
+ * of the host's (xnu.ko gives XNU no more, whatever its cpus parameter asks). A power of two (LINUX64_EL0_CPUS).
+ */
+#define LINUX64_MAX_CPUS 32
+
+/*
  * linux64_el0_stat[cpu][0][class]: exceptions taken from user space, by class; [cpu][1][class]: counter ticks from
  * taking one until the CPU next enters user space (blocking included). Classes: SVC, data abort, instruction abort,
- * host IRQ, other. By XNU CPU number (cpu_number() & (LINUX64_EL0_CPUS - 1)): small, the kernel's data must not grow.
+ * host IRQ, other. By XNU CPU number (cpu_number() & (LINUX64_EL0_CPUS - 1)): one row for each CPU there can be (two
+ * CPUs sharing a row would also share its pending start time and class).
  */
 #define LINUX64_EL0_CLASSES 5
-#define LINUX64_EL0_CPUS 8
+#define LINUX64_EL0_CPUS LINUX64_MAX_CPUS
 
 enum linux64_counter {
 	LINUX64_CTR_IDLE_THREAD  = 0,	/* XNU's idle thread loops */
