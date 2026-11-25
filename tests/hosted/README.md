@@ -34,7 +34,16 @@ for a in arm64 arm64e; do clang -arch $a -o keys-$a keys.c && clang -arch $a -fr
 sh run.sh /path/to/the/folder/with/the/four/programs
 ```
 
-By hand:
+## One-second waits
+
+`timers.c` measures, by the wall clock, how long a one-second wait takes through `usleep`, libdispatch, pthread
+condition variables, kqueue timers and `mach_wait_until` with a count of ticks. `run.sh` runs it after the two programs
+above (prebuilt name: `timers-arm64`). On a host whose counter does not run at a Mac's 24 MHz, an unscaled hosted kernel passes the first five and
+returns from the last after 24 ms (measured on a Google Cloud C4A VM, counter at 1 GHz): code in macOS that counts ticks
+itself then wakes 42 times too often and the hosted system never goes idle. With the counter scaled
+(`mach_timebase_info 125/3`) all six read about 1000 ms, as on a Mac.
+
+## The two programs by hand
 
 ```sh
 clang -arch arm64 -o keys-arm64 keys.c && ./keys-arm64
