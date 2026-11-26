@@ -720,6 +720,48 @@ the VM by DHCP; the tools look it up.
   (Google Cloud C4A, CPU rendering): a 1280x800 frame in 1 to 3 seconds, and a click that the hosted desktop acted on
   ("Your screen is being controlled" shows there). A session with Apple's Screen Sharing app itself was not run.
 
+### A stream from the Linux host (WebRTC)
+
+`tools/hosted/xnu-stream.py` runs on the Linux host, reads the screen where `xnu.ko` dumps it, encodes it there (H.264,
+or VP8 with `--codec vp8`) and pushes it to one browser over WebRTC; the viewer's pointer, buttons, wheel and keys come
+back on a data channel and go to the hosted system as `tools/hosted/xnu-input.py` sends them. macOS takes no part (no
+Screen Sharing, no capture in the guest, no login), so it also shows the login window and costs the hosted system
+nothing but the dump.
+
+On the host, once: `sudo apt-get install --no-install-recommends gstreamer1.0-tools gstreamer1.0-plugins-base
+gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-nice
+gir1.2-gst-plugins-bad-1.0 gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gir1.2-nice-0.1 python3-gst-1.0`, and in
+`/etc/xnulinux.conf` a dump in memory, 60 times a second (the default is once a second, to a file):
+
+```sh
+FB_DUMP=${FB_DUMP:-/dev/shm/xnu-fb.raw}
+XNU_ARGS="${XNU_ARGS:-fb_dump_ms=16}"
+```
+
+Let the boot script create that file (one made by another user in `/dev/shm` is refused: "cannot open fb_dump"); for
+`tools/hosted/fb2png.py` and the helpers that read `/var/tmp/xnu-fb.raw`, link it: `ln -s /dev/shm/xnu-fb.raw
+/var/tmp/xnu-fb.raw`. Then, with the hosted system up:
+
+```sh
+python3 tools/hosted/xnu-stream.py                    # on the host: page on 127.0.0.1:8555, media on TCP port 8556
+ssh -N -L 8555:127.0.0.1:8555 -L 8556:HOST-INTERNAL-ADDRESS:8556 USER@HOST    # on your computer
+```
+
+and open `http://127.0.0.1:8555/`. Nothing is opened to the internet: the page is on the host's loopback and the media
+goes over TCP through the tunnel. `--advertise PUBLIC-ADDRESS` offers UDP on `--media-port` instead, which wants that
+port open to the viewer and the page behind access control of its own (it has none); that was not run.
+
+Measured on a Google Cloud C4A VM from a Mac 50 ms away (headless Chrome, through the tunnel), with a page animating
+in a full-size Safari window: the hosted screen at 47 frames a second (52 without the stream), 46.9 a second decoded by
+the viewer, none dropped, under 1 Mbit/s, 40% of one host CPU. Screen Sharing gave a VNC client 8 to 10 updates a
+second from the same screen. From a click sent by the viewer to the changed pixels back in its video: 306 ms at the
+median (290 to 363), of which the hosted system itself takes 147 (a click written on the host to the changed pixel in
+the dump; 94 to 140 for the Apple menu); the page shows the browser's own pointer, so the pointer moves at once.
+
+Not there yet: the pointer's image (macOS hands it over as a layer of its own, which this display driver does not draw
+without a GPU device, so it is in the dump at some times and not at others: no I-beam or resize arrows), frames are
+read while the display may be writing them (a torn frame now and then), one viewer at a time, no sound.
+
 ### Screen capture and scripting over ssh
 
 A program started from an ssh session cannot capture the screen (`screencapture`: "could not create image from display")
