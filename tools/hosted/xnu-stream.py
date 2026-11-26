@@ -9,17 +9,22 @@ tools/hosted/xnu-input.py writes it. macOS takes no part: no Screen Sharing, no 
     xnu-stream.py [--fb /dev/shm/xnu-fb.raw] [--screen 1280x800] [--input /var/tmp/xnu-input] [--fps 60]
                   [--http 127.0.0.1:8555] [--media-port 8556] [--advertise 127.0.0.1] [--codec h264|vp8] [--kbps 8000]
 
-The page is http://<--http>/. With the default --advertise 127.0.0.1 the media goes over TCP to --media-port, for an
-ssh tunnel and no firewall change:  ssh -L 8555:127.0.0.1:8555 -L 8556:<host address>:8556 host   then open
-http://127.0.0.1:8555/. --advertise <public address> offers UDP (and TCP) on --media-port there instead: that port must
-be open to the viewer, and the page needs its own access control before it is.
+The page is http://<--http>/. With the default --advertise 127.0.0.1 the media goes over TCP to one of the eight ports
+from --media-port up, for an ssh tunnel and no firewall change:
+    ssh -N -L 8555:127.0.0.1:8555 $(for p in 8556 8557 8558 8559 8560 8561 8562 8563; do echo -L $p:<host address>:$p; done) host
+then open http://127.0.0.1:8555/. --advertise <public address> offers UDP (and TCP) on those ports there instead: they
+must be open to the viewer, and the page needs its own access control before they are.
 
 Needs GStreamer 1.20 or later with webrtcbin, libnice, x264enc or vp8enc, and the Python bindings (Ubuntu:
 gstreamer1.0-plugins-{base,good,bad,ugly} gstreamer1.0-nice gir1.2-gst-plugins-bad-1.0 python3-gst-1.0).
 
+A modifier is let go when the browser no longer reports it down or the page loses the keyboard (a system shortcut that
+takes the keyboard away never sends the key-up). Shortcuts the browser or the viewer's system keeps for itself (Command-W,
+Command-Tab) do not reach the page.
+
 Not done yet: the pointer's image (macOS gives it as a layer of its own, which is not in the dump: the page shows the
 browser's pointer, so it moves at once), and frames are read while the display may be writing them (a torn frame now
-and then).
+and then). The page connects again by itself when the streamer or the hosted system restarts.
 """
 import argparse, json, mmap, os, select, signal, socket, struct, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,6 +34,7 @@ gi.require_version('Gst', '1.0'); gi.require_version('GstWebRTC', '1.0'); gi.req
 from gi.repository import GLib, Gst, GstSdp, GstWebRTC  # noqa: E402
 
 EV_SYN, EV_KEY, EV_REL, EV_ABS = 0, 1, 2, 3
+REL_WHEEL_HI_RES, REL_HWHEEL_HI_RES, BTN_TOUCH = 0x0b, 0x0c, 0x14a
 BUTTONS = {0: 0x110, 1: 0x112, 2: 0x111}   # the browser's button numbers: left, middle, right
 CODES = {  # KeyboardEvent.code -> Linux key code (input-event-codes.h)
     'Escape': 1, 'Minus': 12, 'Equal': 13, 'Backspace': 14, 'Tab': 15, 'BracketLeft': 26, 'BracketRight': 27, 'Enter': 28,
@@ -39,6 +45,7 @@ CODES = {  # KeyboardEvent.code -> Linux key code (input-event-codes.h)
     **{'Digit' + d: 2 + i for i, d in enumerate('1234567890')},
     **{'F%d' % (i + 1): 59 + i for i in range(10)},
 }
+MODIFIERS = ((1, (125, 126)), (2, (29, 97)), (4, (56, 100)), (8, (42, 54)))   # the page's bits: meta, control, alt, shift
 for row, start in (('QWERTYUIOP', 16), ('ASDFGHJKL', 30), ('ZXCVBNM', 44)):
     for i, ch in enumerate(row):
         CODES['Key' + ch] = start + i
@@ -49,12 +56,22 @@ class Input:
     def __init__(self, path):
         self.out = open(path, 'ab', buffering=0)
         self.held = set()
+        self.touch, self.sx, self.sy = False, 0.0, 0.0
 
     def send(self, *events):
         self.out.write(b''.join(struct.pack('<HHi', *e) for e in events) + struct.pack('<HHi', EV_SYN, 0, 0))
 
     def message(self, m):
         t = m.get('t')
+        if t == 'release':   # the page lost the keyboard (another window, another tab): nothing stays down
+            self.release_all()
+            return
+        if 'mods' in m:      # the modifiers the browser says are down: one whose key-up never came is let go
+            for bit, codes in MODIFIERS:
+                if not int(m['mods']) & bit:
+                    for code in codes:
+                        if code in self.held:
+                            self.key(code, False)
         if t == 'm':     # pointer at x, y, each 0..1 of the screen
             x, y = (min(max(float(m[k]), 0.0), 1.0) for k in ('x', 'y'))
             self.send((EV_ABS, 0, int(x * 32767)), (EV_ABS, 1, int(y * 32767)))
@@ -62,22 +79,43 @@ class Input:
             self.key(BUTTONS[m['b']], bool(m.get('d')))
         elif t == 'k' and m.get('c') in CODES:
             self.key(CODES[m['c']], bool(m.get('d')))
+        elif t == 's':   # scrolling by pixels (y down, x right): XnuInput's scroll service, 120 units a line of 40 pixels
+            if m.get('g') and not self.touch:
+                self.touch = True
+                self.send((EV_KEY, BTN_TOUCH, 1))          # a gesture begins (only for a page opened with ?gestures=1)
+            self.sx += float(m.get('x', 0)) * 3
+            self.sy += float(m.get('y', 0)) * 3
+            x, y = int(self.sx), int(self.sy)
+            self.sx -= x; self.sy -= y
+            events = [(EV_REL, c, v) for c, v in ((REL_HWHEEL_HI_RES, x), (REL_WHEEL_HI_RES, y)) if v]
+            if events:
+                self.send(*events)
+        elif t == 'se':  # the fingers left: the gesture ends
+            self.end_scroll()
         elif t == 'w':   # wheel notches: y up positive, x right positive
             events = [(EV_REL, c, int(v)) for c, v in ((8, m.get('y', 0)), (6, m.get('x', 0))) if int(v)]
             if events:
                 self.send(*events)
+
+    def end_scroll(self):
+        if self.touch:
+            self.touch = False
+            self.sx = self.sy = 0.0
+            self.send((EV_KEY, BTN_TOUCH, 0))
 
     def key(self, code, down):
         (self.held.add if down else self.held.discard)(code)
         self.send((EV_KEY, code, 1 if down else 0))
 
     def release_all(self):   # the viewer went away with keys or buttons down
+        self.end_scroll()
         for code in sorted(self.held):
             self.send((EV_KEY, code, 0))
         self.held.clear()
 
 
 KEEP = []
+MEDIA_PORTS = 8
 
 
 class Session:
@@ -102,7 +140,9 @@ class Session:
         self.src, self.wb = self.pipe.get_by_name('src'), self.pipe.get_by_name('wb')
         ice = self.wb.get_property('ice-agent')
         KEEP.append(ice)   # webrtcbin holds it by a floating reference, which the binding takes: never let go of it here
-        ice.set_property('min-rtp-port', a.media_port); ice.set_property('max-rtp-port', a.media_port)
+        # A few ports, not one: the connections of a viewer that just left keep its port for a minute (TIME_WAIT), and
+        # the next viewer's listener could not bind it (no candidate was ever gathered: "no offer" for a minute).
+        ice.set_property('min-rtp-port', a.media_port); ice.set_property('max-rtp-port', a.media_port + MEDIA_PORTS - 1)
         ice.set_property('ice-tcp', True); ice.set_property('ice-udp', a.advertise != '127.0.0.1')
         self.offer, self.offered, self.gathered = None, threading.Event(), threading.Event()
         self.wb.connect('on-negotiation-needed', self.negotiate)
@@ -120,7 +160,7 @@ class Session:
             reply = promise.get_reply()
             offer = reply.get_value('offer') if reply and reply.has_field('offer') else None
             if offer is None:
-                print('no offer:', reply.to_string() if reply else promise.wait(), flush=True)
+                print('no offer:', reply.to_string() if reply else promise.wait(), file=sys.stderr, flush=True)
                 return
             wb.emit('set-local-description', offer, Gst.Promise.new())
             self.offered.set()
@@ -132,7 +172,7 @@ class Session:
 
     def state(self, wb, _):
         s = wb.get_property('connection-state')
-        print('viewer:', s.value_nick, flush=True)
+        print('viewer:', s.value_nick, file=sys.stderr, flush=True)
         if s in (GstWebRTC.WebRTCPeerConnectionState.FAILED, GstWebRTC.WebRTCPeerConnectionState.CLOSED,
                  GstWebRTC.WebRTCPeerConnectionState.DISCONNECTED):
             GLib.idle_add(self.close)
@@ -140,6 +180,7 @@ class Session:
     def local_offer(self):
         """The offer once every candidate is in it, with the addresses the viewer can reach."""
         if not self.offered.wait(10) or not self.gathered.wait(10):
+            print('no offer after 10 s: offered %s, candidates gathered %s' % (self.offered.is_set(), self.gathered.is_set()), file=sys.stderr, flush=True)
             return None
         sdp, a, out = self.wb.get_property('local-description').sdp.as_text(), self.a, []
         for line in sdp.split('\r\n'):
@@ -208,14 +249,21 @@ video{position:absolute;inset:0;margin:auto;max-width:100%;max-height:100%;outli
 const v = document.getElementById('v'), s = document.getElementById('s');
 let pc, ch, last = null;
 const send = m => { if (ch && ch.readyState === 'open') ch.send(JSON.stringify(m)); };
+let again = 0;
+function retry(why) {   // the streamer or the hosted system restarted, or the first try came too early: connect again
+  s.textContent = why + ', connecting again';
+  clearTimeout(again); again = setTimeout(() => start().catch(e => retry('failed: ' + e.message)), 2000);
+}
 async function start() {
+  if (pc) { pc.onconnectionstatechange = null; pc.close(); }
+  ch = null; last = null;
   pc = new RTCPeerConnection();
   pc.ontrack = e => {
     v.srcObject = e.streams[0] || new MediaStream([e.track]);
     for (const r of pc.getReceivers()) { if ('jitterBufferTarget' in r) r.jitterBufferTarget = 0; if ('playoutDelayHint' in r) r.playoutDelayHint = 0; }
   };
   pc.ondatachannel = e => { ch = e.channel; };
-  pc.onconnectionstatechange = () => { s.textContent = pc.connectionState; };
+  pc.onconnectionstatechange = () => { s.textContent = pc.connectionState; if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) retry(pc.connectionState); };
   const offer = await (await fetch('session', { method: 'POST' })).json();
   if (!offer.sdp) throw new Error(offer.error || 'no offer');
   await pc.setRemoteDescription({ type: 'offer', sdp: offer.sdp });
@@ -230,13 +278,29 @@ function at(e) {   // the pointer's place on the screen, 0..1 each way, inside t
   return { x: (e.clientX - r.left - (r.width - w) / 2) / w, y: (e.clientY - r.top - (r.height - h) / 2) / h };
 }
 v.addEventListener('pointermove', e => { for (const c of (e.getCoalescedEvents ? e.getCoalescedEvents().slice(-1) : [e])) send({ t: 'm', ...at(c) }); });
-v.addEventListener('pointerdown', e => { v.focus(); v.setPointerCapture(e.pointerId); send({ t: 'm', ...at(e) }); send({ t: 'b', b: e.button, d: 1 }); e.preventDefault(); });
-v.addEventListener('pointerup', e => { send({ t: 'm', ...at(e) }); send({ t: 'b', b: e.button, d: 0 }); e.preventDefault(); });
+// The modifiers as the browser has them now, sent with every button, key and wheel message: a key-up that never reached
+// this page (a system shortcut took the keyboard away with Command down) must not leave the key down on the other side.
+const mods = e => (e.metaKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.altKey ? 4 : 0) | (e.shiftKey ? 8 : 0);
+v.addEventListener('pointerdown', e => { v.focus(); v.setPointerCapture(e.pointerId); send({ t: 'm', ...at(e) }); send({ t: 'b', b: e.button, d: 1, mods: mods(e) }); e.preventDefault(); });
+v.addEventListener('pointerup', e => { send({ t: 'm', ...at(e) }); send({ t: 'b', b: e.button, d: 0, mods: mods(e) }); e.preventDefault(); });
 v.addEventListener('contextmenu', e => e.preventDefault());
-let wheel = 0;
-v.addEventListener('wheel', e => { wheel += e.deltaY; const n = Math.trunc(wheel / 40); if (n) { wheel -= n * 40; send({ t: 'w', y: -n }); } e.preventDefault(); }, { passive: false });
-v.addEventListener('keydown', e => { send({ t: 'k', c: e.code, d: 1 }); e.preventDefault(); });
-v.addEventListener('keyup', e => { send({ t: 'k', c: e.code, d: 0 }); e.preventDefault(); });
+// Scrolling goes over by the pixel, as the browser reports it (two fingers on a trackpad, either way). With ?gestures=1
+// in the address it also goes over as a gesture that begins and, a moment after its last event, ends: what a swipe on
+// the other side waits for. That is off by default: a swipe on a notification was not dismissed with it, and before the
+// end of a gesture was sure to arrive, one such swipe stopped all scrolling there until the hosted system restarted.
+const gestures = new URLSearchParams(location.search).get('gestures') === '1';
+let scrollEnd = 0;
+v.addEventListener('wheel', e => {
+  const unit = e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? 400 : 1;
+  send({ t: 's', x: e.deltaX * unit, y: e.deltaY * unit, g: gestures ? 1 : 0, mods: mods(e) });
+  if (gestures) { clearTimeout(scrollEnd); scrollEnd = setTimeout(() => send({ t: 'se' }), 150); }
+  e.preventDefault();
+}, { passive: false });
+v.addEventListener('keydown', e => { send({ t: 'k', c: e.code, d: 1, mods: mods(e) }); e.preventDefault(); });
+v.addEventListener('keyup', e => { send({ t: 'k', c: e.code, d: 0, mods: mods(e) }); e.preventDefault(); });
+const release = () => send({ t: 'release' });
+window.addEventListener('blur', release); v.addEventListener('blur', release); window.addEventListener('pagehide', release);
+document.addEventListener('visibilitychange', () => { if (document.hidden) release(); });
 window.xnuStats = async () => {   // for a check without a person: what arrives and how long it waits before it is shown
   const o = { state: pc && pc.connectionState, width: v.videoWidth, height: v.videoHeight, channel: ch && ch.readyState };
   for (const r of (await pc.getStats()).values()) {
@@ -248,7 +312,7 @@ window.xnuStats = async () => {   // for a check without a person: what arrives 
 };
 setInterval(async () => { if (!pc || pc.connectionState !== 'connected') return; const o = await xnuStats(); if (last) s.textContent = (o.frames - last.frames) + ' frames a second, ' + Math.round((o.bytes - last.bytes) * 8 / 1000) + ' kbit/s, wait ' + Math.round(o.jitterBufferMs || 0) + ' ms'; last = o; }, 1000);
 window.xnuSend = send;
-start().catch(e => { s.textContent = 'failed: ' + e; });
+start().catch(e => retry('failed: ' + e.message));
 </script>'''
 
 
@@ -306,7 +370,7 @@ def serve(a, argv):
             self.end_headers(); self.wfile.write(body)
 
         def do_GET(self):
-            if self.path == '/':
+            if self.path.split('?')[0] == '/':
                 self.reply(200, 'text/html; charset=utf-8', PAGE.encode())
             elif self.path == '/stats':
                 w = state['worker']
@@ -371,7 +435,7 @@ def main():
     if a.worker:
         worker(a)
         return
-    print('page http://%s/  media %s:%d (offered as %s)  %s %d kbit/s' % (a.http, a.host_ip, a.media_port, a.advertise, a.codec, a.kbps), flush=True)
+    print('page http://%s/  media %s:%d-%d (offered as %s)  %s %d kbit/s' % (a.http, a.host_ip, a.media_port, a.media_port + MEDIA_PORTS - 1, a.advertise, a.codec, a.kbps), flush=True)
     serve(a, [x for x in sys.argv[1:] if x != '--worker'])
 
 

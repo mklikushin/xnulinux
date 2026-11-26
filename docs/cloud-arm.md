@@ -743,13 +743,13 @@ Let the boot script create that file (one made by another user in `/dev/shm` is 
 /var/tmp/xnu-fb.raw`. Then, with the hosted system up:
 
 ```sh
-python3 tools/hosted/xnu-stream.py                    # on the host: page on 127.0.0.1:8555, media on TCP port 8556
-ssh -N -L 8555:127.0.0.1:8555 -L 8556:HOST-INTERNAL-ADDRESS:8556 USER@HOST    # on your computer
+python3 tools/hosted/xnu-stream.py                    # on the host: page on 127.0.0.1:8555, media on TCP ports 8556 to 8563
+ssh -N -L 8555:127.0.0.1:8555 $(for p in 8556 8557 8558 8559 8560 8561 8562 8563; do echo -L $p:HOST-INTERNAL-ADDRESS:$p; done) USER@HOST    # on your computer
 ```
 
 and open `http://127.0.0.1:8555/`. Nothing is opened to the internet: the page is on the host's loopback and the media
-goes over TCP through the tunnel. `--advertise PUBLIC-ADDRESS` offers UDP on `--media-port` instead, which wants that
-port open to the viewer and the page behind access control of its own (it has none); that was not run.
+goes over TCP through the tunnel (eight ports, because the connections of a viewer that just left hold its port for a
+minute). `--advertise PUBLIC-ADDRESS` offers UDP on those ports instead, which wants them open to the viewer and the page behind access control of its own (it has none); that was not run.
 
 Measured on a Google Cloud C4A VM from a Mac 50 ms away (headless Chrome, through the tunnel), with a page animating
 in a full-size Safari window: the hosted screen at 47 frames a second (52 without the stream), 46.9 a second decoded by
@@ -758,7 +758,21 @@ second from the same screen. From a click sent by the viewer to the changed pixe
 median (290 to 363), of which the hosted system itself takes 147 (a click written on the host to the changed pixel in
 the dump; 94 to 140 for the Apple menu); the page shows the browser's own pointer, so the pointer moves at once.
 
-Not there yet: the pointer's image (macOS hands it over as a layer of its own, which this display driver does not draw
+Scrolling goes over by the pixel and arrives as a trackpad's would: `XnuInput` has a scroll service of its own
+(`XnuScroll`, an `IOHIDEventService`) that dispatches unaccelerated scroll events with the phases of a gesture, fed by
+Linux's `REL_WHEEL_HI_RES` and `REL_HWHEEL_HI_RES` records (120 units are a line of 40 pixels) between a `BTN_TOUCH`
+down and up. A HID wheel would not do: the event system scales it by how fast its reports come, not by what they say
+(one report 4 pixels, twenty within a third of a second 2400, whatever their value), and neither
+`com.apple.scrollwheel.scaling -1` nor the device's `HIDScrollAcceleration` property changed that. Checked through the
+stream: wheel events of 300, 200 and -400 pixels moved a page in the hosted Chrome by exactly that. A modifier key is
+let go when the browser no longer reports it down or the page loses the keyboard: a system shortcut on the viewer's side
+(a screen recording's, Command-Tab) takes the keyboard away with Command down and the key-up never comes, after which
+every click was a Command-click (a Dock icon opened its folder, a Safari tab did not switch).
+
+Not there yet: a two-finger swipe does not dismiss a notification (its close button, which shows under the pointer,
+does; `?gestures=1` on the page's address sends scrolling as gestures with a beginning and an end, which did not
+dismiss one either when tried, and is off otherwise), shortcuts the viewer's browser or system keeps (Command-W, Command-Tab) do not reach the hosted system, the
+pointer's image (macOS hands it over as a layer of its own, which this display driver does not draw
 without a GPU device, so it is in the dump at some times and not at others: no I-beam or resize arrows), frames are
 read while the display may be writing them (a torn frame now and then), one viewer at a time, no sound.
 

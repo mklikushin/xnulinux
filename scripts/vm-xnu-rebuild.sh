@@ -44,7 +44,7 @@ if [ -e out/kc/kc27.bin ]; then
   # IOHIDFamily's kernel headers (IOKit/hid/*.h) for XnuInput and IOStorageFamily's (IOKit/storage/*.h) for XnuDisk: the SDK's
   # Kernel.framework has them
   for h in toolchains/sdks/*.sdk/System/Library/Frameworks/Kernel.framework/Headers/IOKit/hid; do
-    [ -e $h/IOHIDDevice.h ] && { ln -sfn $PWD/$h $NETINC/IOKit/hid; ln -sfn $PWD/$h/../hidsystem $NETINC/IOKit/hidsystem; ln -sfn $PWD/$h/../graphics $NETINC/IOKit/graphics; ln -sfn $PWD/$h/../storage $NETINC/IOKit/storage
+    [ -e $h/IOHIDDevice.h ] && { ln -sfn $PWD/$h $NETINC/IOKit/hid; ln -sfn $PWD/$h/../hidsystem $NETINC/IOKit/hidsystem; ln -sfn $PWD/$h/../hidevent $NETINC/IOKit/hidevent; ln -sfn $PWD/$h/../graphics $NETINC/IOKit/graphics; ln -sfn $PWD/$h/../storage $NETINC/IOKit/storage
       ln -sfn $PWD/${h%%/System/*}/usr/include/TargetConditionals.h $NETINC/TargetConditionals.h
       ln -sfn $PWD/$h/../../HIDDriverKit $NETINC/HIDDriverKit; break; }	# IOHIDDevice.h includes HIDDriverKit/IOHIDDevice.h
   done
@@ -52,7 +52,7 @@ if [ -e out/kc/kc27.bin ]; then
     [ -e "$j" ] || continue
     n=$(basename $j .json)
     # a kext that does not build is left out of the collection (reported), not the whole rebuild
-    python3 scripts/build-native-kext.py $n $(dirname $j)/$n.cpp -I $NETINC --obj ${KEXT_OBJ:-k27-obj} || { echo "kext $n failed to build: left out"; continue; }
+    python3 scripts/build-native-kext.py $n $(dirname $j)/$n.cpp -I $NETINC -I ~/w/poc/kexts/include --obj ${KEXT_OBJ:-k27-obj} || { echo "kext $n failed to build: left out"; continue; }
     NATIVE="$NATIVE $j"
   done
   t=$SECONDS; K27_NO_BOOT=1 NATIVE="$NATIVE" bash k27/try.sh 0 2>&1 | tail -3; echo "collection: $((SECONDS - t)) s"

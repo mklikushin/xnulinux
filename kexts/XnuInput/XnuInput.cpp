@@ -10,6 +10,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
 #include <IOKit/hid/IOHIDDevice.h>
+#include <IOKit/hidevent/IOHIDEventService.h>
 #include <kern/thread.h>
 
 extern "C" long linux64_input_read(void *buffer, unsigned long size);
@@ -17,7 +18,8 @@ extern "C" long linux64_input_read(void *buffer, unsigned long size);
 namespace {
 
 enum : uint16_t { evSyn = 0, evKey = 1, evRel = 2, evAbs = 3, synReport = 0 };
-enum : uint16_t { absX = 0x00, absY = 0x01, relWheel = 0x08, btnLeft = 0x110, btnRight = 0x111, btnMiddle = 0x112 };
+enum : uint16_t { absX = 0x00, absY = 0x01, relHWheel = 0x06, relWheel = 0x08, relWheelHiRes = 0x0b, relHWheelHiRes = 0x0c,
+                  btnLeft = 0x110, btnRight = 0x111, btnMiddle = 0x112, btnTouch = 0x14a };
 enum class Kind : uint8_t { keyboard, tablet };
 constexpr unsigned pollMs = 4;
 
@@ -59,6 +61,7 @@ const uint8_t tabletDescriptor[] = {
   0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x00, 0x26, 0xff, 0x7f, 0x35, 0x00, 0x46, 0xff, 0x7f, 0x75, 0x10, 0x95, 0x02,
   0x81, 0x02,
   0x05, 0x01, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7f, 0x35, 0x00, 0x45, 0x00, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06,
+  0x05, 0x0c, 0x0a, 0x38, 0x02, 0x15, 0x81, 0x25, 0x7f, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06,   // Consumer: AC Pan, the wheel sideways
   0xc0, 0xc0,
 };
 
@@ -103,19 +106,59 @@ IOReturn XnuHIDDevice::newReportDescriptor(IOMemoryDescriptor **descriptor) cons
   return *descriptor ? kIOReturnSuccess : kIOReturnNoMemory;
 }
 
+// Scrolling as a trackpad gives it. A HID wheel is no use for a viewer's two fingers: the event system scales a wheel by
+// how fast its reports come, not by what they say (one report 4 pixels, twenty in a third of a second 2400, whatever the
+// value in them), and the settings that turn that off did nothing here. This service dispatches scroll events itself:
+// fixed-point amounts, no acceleration, and the phases of a gesture (began, changed, ended), which swipes on a
+// notification or between pages wait for. Linux REL_WHEEL_HI_RES and REL_HWHEEL_HI_RES carry the amounts (120 a line),
+// BTN_TOUCH the gesture: down before its first scroll, up after its last.
+class XnuScroll : public IOHIDEventService {
+  OSDeclareDefaultStructors(XnuScroll)
+
+public:
+  bool handleStart(IOService *) override { return true; }
+  OSString *getTransport() override { return OSString::withCString("Virtual"); }
+  OSString *getManufacturer() override { return OSString::withCString("xnulinux"); }
+  OSString *getProduct() override { return OSString::withCString("xnulinux Scroll"); }
+  UInt32 getVendorID() override { return 0x1209; }
+  UInt32 getProductID() override { return 0x5803; }
+  UInt32 getLocationID() override { return 0x58550003; }
+  UInt32 getPrimaryUsagePage() override { return kHIDPage_GenericDesktop; }
+  UInt32 getPrimaryUsage() override { return kHIDUsage_GD_Mouse; }
+  OSArray *getReportElements() override { return OSArray::withCapacity(1); }
+
+  void scroll(int32_t x, int32_t y, IOOptionBits options)   // 120ths of a line
+  {
+    AbsoluteTime now;
+    clock_get_uptime(&now);
+    IOFixed fy = static_cast<IOFixed>(static_cast<int64_t>(y) * 65536 / 120), fx = static_cast<IOFixed>(static_cast<int64_t>(x) * 65536 / 120);
+    // An event that moves nothing is not dispatched, and a gesture whose end never arrives holds every later scroll
+    // (after a swipe on a notification nothing scrolled any more): the end carries the smallest amount there is.
+    if (!fx && !fy)
+      fy = 1;
+    dispatchScrollWheelEventWithFixed(now, fy, fx, 0, options | kHIDDispatchOptionScrollNoAcceleration);
+  }
+};
+
+OSDefineMetaClassAndStructors(XnuScroll, IOHIDEventService)
+
 class XnuInput : public IOService {
   OSDeclareDefaultStructors(XnuInput)
 
   XnuHIDDevice *fKeyboard = nullptr, *fTablet = nullptr;
   uint8_t fModifiers = 0, fKeys[6] = {}, fLastKeyboard[8] = {};
-  int32_t fX = 0, fY = 0, fWheel = 0;
-  uint8_t fButtons = 0, fLastTablet[6] = {};
+  XnuScroll *fScroll = nullptr;
+  int32_t fScrollX = 0, fScrollY = 0;
+  bool fTouchDown = false, fTouchUp = false, fGesture = false, fGestureBegan = false;
+  int32_t fX = 0, fY = 0, fWheel = 0, fPan = 0;
+  uint8_t fButtons = 0, fLastTablet[7] = {};
   bool fFirstTablet = true;
   Event fEvents[64];
 
   XnuHIDDevice *makeDevice(Kind kind);
   void event(const Event &e);
   void report();
+  void scrollReport();
   static void pollThread(void *self, wait_result_t);
 
 public:
@@ -155,6 +198,12 @@ bool XnuInput::start(IOService *provider)
     IOLog("XnuInput: cannot start the HID devices (keyboard %p, tablet %p)\n", fKeyboard, fTablet);
     return false;
   }
+  fScroll = OSTypeAlloc(XnuScroll);   // without it the wheel still scrolls
+  if (fScroll && !(fScroll->init(nullptr) && fScroll->attach(this) && fScroll->start(this))) {
+    IOLog("XnuInput: no scroll service\n");
+    fScroll->release();
+    fScroll = nullptr;
+  }
   registerService();
   thread_t thread;
   if (kernel_thread_start(pollThread, this, &thread) != KERN_SUCCESS)
@@ -188,6 +237,8 @@ void XnuInput::event(const Event &e)
           break;
         }
     }
+  } else if (e.type == evKey && e.code == btnTouch) {
+    (e.value ? fTouchDown : fTouchUp) = true;
   } else if (e.type == evKey) {
     uint8_t mask = e.code == btnLeft ? 1 : e.code == btnRight ? 2 : e.code == btnMiddle ? 4 : 0;
     fButtons = e.value ? fButtons | mask : fButtons & ~mask;
@@ -198,6 +249,12 @@ void XnuInput::event(const Event &e)
       fY = e.value;
   } else if (e.type == evRel && e.code == relWheel) {
     fWheel += e.value;
+  } else if (e.type == evRel && e.code == relHWheel) {
+    fPan += e.value;
+  } else if (e.type == evRel && e.code == relWheelHiRes) {
+    fScrollY += e.value;
+  } else if (e.type == evRel && e.code == relHWheelHiRes) {
+    fScrollX += e.value;
   }
 }
 
@@ -214,17 +271,45 @@ void XnuInput::report()
     }
   }
   uint16_t x = clamp15(fX), y = clamp15(fY);
-  int8_t wheel = clamp8(fWheel);
-  fWheel = 0;
-  uint8_t tablet[6] = {fButtons, static_cast<uint8_t>(x), static_cast<uint8_t>(x >> 8), static_cast<uint8_t>(y),
-                       static_cast<uint8_t>(y >> 8), static_cast<uint8_t>(wheel)};
-  if (fFirstTablet || wheel || memcmp(tablet, fLastTablet, sizeof(tablet))) {
+  int8_t wheel = clamp8(fWheel), pan = clamp8(fPan);
+  fWheel = fPan = 0;
+  uint8_t tablet[7] = {fButtons, static_cast<uint8_t>(x), static_cast<uint8_t>(x >> 8), static_cast<uint8_t>(y),
+                       static_cast<uint8_t>(y >> 8), static_cast<uint8_t>(wheel), static_cast<uint8_t>(pan)};
+  if (fFirstTablet || wheel || pan || memcmp(tablet, fLastTablet, sizeof(tablet))) {
     fFirstTablet = false;
     memcpy(fLastTablet, tablet, sizeof(tablet));
     if (IOBufferMemoryDescriptor *r = IOBufferMemoryDescriptor::withBytes(tablet, sizeof(tablet), kIODirectionNone)) {
       fTablet->handleReport(r);
       r->release();
     }
+  }
+  scrollReport();
+}
+
+// The frame's scrolling, with its place in the gesture.
+void XnuInput::scrollReport()
+{
+  if (!fScroll) {
+    fScrollX = fScrollY = 0;
+    fTouchDown = fTouchUp = false;
+    return;
+  }
+  if (fTouchDown) {
+    fTouchDown = false;
+    fGesture = true;
+    fGestureBegan = false;
+  }
+  if (fScrollX || fScrollY) {
+    IOOptionBits phase = !fGesture ? 0 : fGestureBegan ? kHIDDispatchOptionPhaseChanged : kHIDDispatchOptionPhaseBegan;
+    fGestureBegan = fGesture;
+    fScroll->scroll(fScrollX, fScrollY, phase);
+    fScrollX = fScrollY = 0;
+  }
+  if (fTouchUp) {
+    fTouchUp = false;
+    if (fGesture && fGestureBegan)
+      fScroll->scroll(0, 0, kHIDDispatchOptionPhaseEnded);
+    fGesture = fGestureBegan = false;
   }
 }
 
