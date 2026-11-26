@@ -7,7 +7,9 @@ lp_build_half_to_float has AArch64 convert in one instruction (lp_has_fp16: an f
 only for x86's F16C and otherwise packs each channel with some thirty integer operations (lp_build_float_to_smallfloat).
 The window server's intermediate surfaces are RGBA16Float, so every pixel it stores paid that. AArch64 now takes an
 fptrunc (fcvtn). It rounds to nearest even where the generic path truncates: at most one unit in the last place of the
-half. GALLIVM_SOFT_FLOAT_TO_HALF=1 keeps the generic path, to compare.
+half. GALLIVM_SOFT_FLOAT_TO_HALF=1 keeps the generic path, to compare: with MESA_SHADER_CACHE_DISABLE=true or the
+shader cache cleared, since the variable is not in the cache's key (60 blended full-screen draws into RGBA16Float on a
+Neoverse V2, 8 threads: 46.8 ms against 63.0).
 
 --- a/src/gallium/auxiliary/gallivm/lp_bld_conv.c
 +++ b/src/gallium/auxiliary/gallivm/lp_bld_conv.c
