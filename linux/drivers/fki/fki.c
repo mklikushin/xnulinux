@@ -18,13 +18,15 @@
 #include <linux/slab.h>
 #include <linux/sched.h>
 #include <linux/cpumask.h>
+#include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 #include <asm/arch_timer.h>
 #include <asm/sysreg.h>
 
 int fki_version(void)
 {
-	return FKI_VERSION;
+	/* This minimal in-tree driver implements only the FKI v0 subset; full FKI v1 lives in fki-ko/. */
+	return 0;
 }
 EXPORT_SYMBOL(fki_version);
 
@@ -136,10 +138,11 @@ void fki_leave(unsigned long cookie, const struct fki_pac_keys *saved)
 }
 EXPORT_SYMBOL(fki_leave);
 
-void fki_pac_swap(const struct fki_pac_keys *load, struct fki_pac_keys *save)
+int fki_pac_swap(const struct fki_pac_keys *load, struct fki_pac_keys *save)
 {
 	keys_read(save);
 	keys_write(load);
+	return 0;
 }
 EXPORT_SYMBOL(fki_pac_swap);
 
@@ -161,6 +164,12 @@ void fki_random(void *buf, unsigned long len)
 }
 EXPORT_SYMBOL(fki_random);
 
+int fki_random_wait(void)
+{
+	return wait_for_random_bytes();
+}
+EXPORT_SYMBOL(fki_random_wait);
+
 int fki_bind_cpu(int cpu)
 {
 	if (cpu < 0 || cpu >= nr_cpu_ids || !cpu_online(cpu))
@@ -168,3 +177,83 @@ int fki_bind_cpu(int cpu)
 	return set_cpus_allowed_ptr(current, cpumask_of(cpu));
 }
 EXPORT_SYMBOL(fki_bind_cpu);
+
+/* FKI v1 capability & EL0/high-window stubs (native EL1 backend). */
+unsigned long fki_caps(void)
+{
+	return FKI_CAP_PAC | FKI_CAP_EXEC_ONLY;
+}
+EXPORT_SYMBOL(fki_caps);
+
+int fki_cpu_id(void)
+{
+	return smp_processor_id();
+}
+EXPORT_SYMBOL(fki_cpu_id);
+
+void fki_log_alert(const char *s, unsigned long len)
+{
+	pr_alert("fki: %.*s\n", (int)len, s);
+}
+EXPORT_SYMBOL(fki_log_alert);
+
+int fki_kmem_alloc(unsigned long size, unsigned long high_va, fki_u64 pa_base, struct fki_region *r) { return -EOPNOTSUPP; }
+EXPORT_SYMBOL(fki_kmem_alloc);
+int fki_kmem_alias(struct fki_region *r, unsigned long va, unsigned long size) { return -EOPNOTSUPP; }
+EXPORT_SYMBOL(fki_kmem_alias);
+void fki_kmem_free(struct fki_region *r) {}
+EXPORT_SYMBOL(fki_kmem_free);
+int fki_high_map(unsigned long va, fki_u64 xpa, unsigned long size, int prot) { return -EOPNOTSUPP; }
+EXPORT_SYMBOL(fki_high_map);
+void fki_high_unmap(unsigned long va, unsigned long size) {}
+EXPORT_SYMBOL(fki_high_unmap);
+void fki_high_flush(void) {}
+EXPORT_SYMBOL(fki_high_flush);
+int fki_high_read_u64x2(unsigned long va, fki_u64 *out0, fki_u64 *out1)
+{
+	fki_u64 pair[2];
+
+	if (!out0 || !out1 || (va & 7UL) || va < 0xffffff8000000000UL || va > 0xfffffffc00000000UL - sizeof(pair))
+		return -EFAULT;
+	if (copy_from_kernel_nofault(pair, (const void *)va, sizeof(pair)) != 0)
+		return -EFAULT;
+	*out0 = pair[0];
+	*out1 = pair[1];
+	return 0;
+}
+EXPORT_SYMBOL(fki_high_read_u64x2);
+void fki_icache_flush(unsigned long va, unsigned long size)
+{
+	(void)va;
+	(void)size;
+	asm volatile("dsb ish; ic ialluis; dsb ish; isb" ::: "memory");
+}
+EXPORT_SYMBOL(fki_icache_flush);
+void *fki_as_create(void) { return NULL; }
+EXPORT_SYMBOL(fki_as_create);
+void fki_as_destroy(void *as) {}
+EXPORT_SYMBOL(fki_as_destroy);
+int fki_as_map(void *as, unsigned long va, fki_u64 xpa, unsigned long size, int prot) { return -EOPNOTSUPP; }
+EXPORT_SYMBOL(fki_as_map);
+void fki_as_unmap(void *as, unsigned long va, unsigned long size) {}
+EXPORT_SYMBOL(fki_as_unmap);
+void fki_as_flush(void *as) {}
+EXPORT_SYMBOL(fki_as_flush);
+void *fki_utcb_create(void *as) { return NULL; }
+EXPORT_SYMBOL(fki_utcb_create);
+void fki_utcb_destroy(void *utcb) {}
+EXPORT_SYMBOL(fki_utcb_destroy);
+int fki_utcb_set_as(void *utcb, void *as) { return -EOPNOTSUPP; }
+EXPORT_SYMBOL(fki_utcb_set_as);
+int fki_utcb_set_pac(void *utcb, const struct fki_pac_keys *keys) { return -EOPNOTSUPP; }
+EXPORT_SYMBOL(fki_utcb_set_pac);
+int fki_utcb_run(void *utcb, struct fki_utcb_regs *regs, struct fki_utcb_stop *stop) { return -EOPNOTSUPP; }
+EXPORT_SYMBOL(fki_utcb_run);
+int fki_utcb_resume(void *utcb, struct fki_utcb_regs *regs, struct fki_utcb_stop *stop) { return -ENOSYS; }
+EXPORT_SYMBOL(fki_utcb_resume);
+int fki_utcb_sync_regs(void *utcb, struct fki_utcb_regs *regs) { return -ENOSYS; }
+EXPORT_SYMBOL(fki_utcb_sync_regs);
+int fki_utcb_fpu_read(void *utcb, void *buf, unsigned long len) { return -EOPNOTSUPP; }
+EXPORT_SYMBOL(fki_utcb_fpu_read);
+int fki_utcb_fpu_write(void *utcb, const void *buf, unsigned long len) { return -EOPNOTSUPP; }
+EXPORT_SYMBOL(fki_utcb_fpu_write);

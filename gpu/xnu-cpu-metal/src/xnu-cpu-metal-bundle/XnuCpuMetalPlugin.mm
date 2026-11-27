@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include <os/lock.h>
 #include <objc/message.h>
 // XnuCpuMetal.bundle — Pure-CPU Metal plugin for xnulinux (macOS 27).
 // Principal class: XnuCpuMetalDevice (subclass of IOGPUMetalDevice).
@@ -607,6 +608,9 @@ static bool xcmIOSurfacePlaneLayout(IOSurfaceRef surf, NSUInteger plane, NSUInte
 - (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice
             withBytes:(const void *)pixelBytes bytesPerRow:(NSUInteger)bytesPerRow bytesPerImage:(NSUInteger)bytesPerImage {
     if (_handle) {
+        // The write-back below is the whole texture: what the surface holds now goes in first, or the rest of what was
+        // drawn into the surface since the last sync is lost to a write of one region.
+        if (_iosurface && level == 0 && slice == 0) [self syncFromIOSurfaceIfNeeded];
         xm2v_texture_replace_region(_handle,
             region.origin.x, region.origin.y, region.origin.z,
             region.size.width, region.size.height, region.size.depth,
@@ -649,7 +653,9 @@ static bool xcmIOSurfacePlaneLayout(IOSurfaceRef surf, NSUInteger plane, NSUInte
     desc.depth = MAX(1ul, _depth >> levelRange.location);
     desc.mipmapLevelCount = levelRange.length;
     desc.sampleCount = _sampleCount;
-    desc.arrayLength = sliceRange.length;
+    // arrayLength counts cubes for a cube type, and a cube is six of the slices
+    bool cubes = textureType == MTLTextureTypeCube || textureType == MTLTextureTypeCubeArray;
+    desc.arrayLength = cubes ? MAX(1ul, sliceRange.length / 6) : sliceRange.length;
     desc.usage = _usage;
     desc.resourceOptions = _options;
     XcmTexture *view = [[XcmTexture alloc] initWithHandle:vh device:_device descriptor:desc];
@@ -668,9 +674,10 @@ static bool xcmIOSurfacePlaneLayout(IOSurfaceRef surf, NSUInteger plane, NSUInte
     return (id<MTLTexture>)view;
 }
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)pixelFormat {
+    bool cubes = _textureType == MTLTextureTypeCube || _textureType == MTLTextureTypeCubeArray;   // six slices each
     return [self newTextureViewWithPixelFormat:pixelFormat textureType:_textureType
                                         levels:NSMakeRange(0, _mipLevels)
-                                        slices:NSMakeRange(0, _arrayLength)];
+                                        slices:NSMakeRange(0, cubes ? _arrayLength * 6 : _arrayLength)];
 }
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)pixelFormat
                                     textureType:(MTLTextureType)textureType
@@ -1952,8 +1959,10 @@ static void xcmSharedEventNotified(void *context, uint64_t value) {
       destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level destinationOrigin:(MTLOrigin)origin {
     if (!_handle || !src || !dst || ![(id)src isKindOfClass:[XcmBuffer class]] || ![(id)dst isKindOfClass:[XcmTexture class]]) return;
     [_cmdBuf retainResource:src]; [_cmdBuf retainResource:dst];
-    if (((XcmTexture *)dst)->_iosurface)
+    if (((XcmTexture *)dst)->_iosurface) {
+        [(XcmTexture *)dst syncFromIOSurfaceIfNeeded];   // the copy may cover a part; the write-back covers all
         [_cmdBuf markDirtyIOSurfaceTexture:(XcmTexture *)dst];
+    }
     xm2v_blit_encoder_copy_buffer_to_texture(_handle, ((XcmBuffer *)src)->_handle, srcOff, bpr, bpi,
         sz.width, sz.height, sz.depth, ((XcmTexture *)dst)->_handle, slice, level, origin.x, origin.y, origin.z);
 }
@@ -1972,8 +1981,10 @@ static void xcmSharedEventNotified(void *context, uint64_t value) {
     if (!_handle || !src || !dst || ![(id)src isKindOfClass:[XcmTexture class]] || ![(id)dst isKindOfClass:[XcmTexture class]]) return;
     [_cmdBuf retainResource:src]; [_cmdBuf retainResource:dst];
     [(XcmTexture *)src syncFromIOSurfaceIfNeeded];
-    if (((XcmTexture *)dst)->_iosurface)
+    if (((XcmTexture *)dst)->_iosurface) {
+        [(XcmTexture *)dst syncFromIOSurfaceIfNeeded];   // the copy may cover a part; the write-back covers all
         [_cmdBuf markDirtyIOSurfaceTexture:(XcmTexture *)dst];
+    }
     xm2v_blit_encoder_copy_texture_to_texture(_handle, ((XcmTexture *)src)->_handle, ss, sl,
         so.x, so.y, so.z, sz.width, sz.height, sz.depth, ((XcmTexture *)dst)->_handle, ds, dl, do_.x, do_.y, do_.z);
 }
@@ -2062,12 +2073,16 @@ static void xcmSharedEventNotified(void *context, uint64_t value) {
 }
 - (NSError *)error {
     if (self.status == MTLCommandBufferStatusError) {
+        // This command buffer's own text. Not xcmError: it prefers the thread's last bridge error, which is whatever
+        // call failed last on this thread (a function a library does not have, long ago), not this failure.
         char buf[512] = {};
+        NSString *text = nil;
         if (_handle && xm2v_command_buffer_error(_handle, buf, sizeof(buf)) > 0) {
             os_log_error(OS_LOG_DEFAULT, "XnuCpuMetal: command buffer error (cb=%p): %{public}s", (__bridge void *)self, buf);
-            return xcmError(MTLCommandBufferErrorDomain, MTLCommandBufferErrorInternal, buf);
+            text = [NSString stringWithUTF8String:buf];
         }
-        return xcmError(MTLCommandBufferErrorDomain, MTLCommandBufferErrorInternal, "Command buffer failed");
+        return [NSError errorWithDomain:MTLCommandBufferErrorDomain code:MTLCommandBufferErrorInternal
+                               userInfo:@{NSLocalizedDescriptionKey: text ?: @"Command buffer failed"}];
     }
     return nil;
 }
@@ -2390,27 +2405,30 @@ static NSUInteger xcmDev_rwTexTier(id, SEL) { return MTLReadWriteTextureTier2; }
 static BOOL xcmDev_yes(id, SEL) { return YES; }
 static BOOL xcmDev_supportsSampleCount(id, SEL, NSUInteger c) { return c == 1; }
 static BOOL xcmDev_supportsFeatureSet(id, SEL, NSUInteger) { return YES; }
-// The bridge's answer for a family, kept. CoreAnimation asks supportsFamily: many times in every frame, and the bridge
-// works each answer out again from its tables (an audit of every row of the family, cloning each format's answers): it
-// was half of WindowServer's main thread while the screen changed (436 of 872 samples under xcmDev_supportsFamily with
-// the desktop at 4 to 5 frames a second). The answer is the device's and does not change while the process lives.
-static BOOL xcmBridgeSupportsFamily(int64_t family) {
-    static std::atomic<uint64_t> slots[32];   // family << 2 | 2 | answer; 0: empty
-    const uint64_t key = ((uint64_t)family << 2) | 2;
-    for (auto &slot : slots) {
-        uint64_t v = slot.load(std::memory_order_acquire);
-        if (v == 0) break;
-        if ((v & ~1ull) == key) return (v & 1) ? YES : NO;
+// A device's families do not change, and the bridge audits its whole format table to answer for one. Metal asks
+// several times for every MTLPixelFormatGetInfoForDevice, which CoreAnimation calls for each surface it makes: half of
+// WindowServer's time in a display update went there. Each answer is kept (per device, a handful of families).
+static bool xcmBridgeSupportsFamily(int64_t family) {
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+    static const void *dev;
+    static struct { int64_t family; bool yes; } known[32];
+    static unsigned n;
+    const void *d = gXm2vDevice;
+    if (!d) return false;
+    os_unfair_lock_lock(&lock);
+    if (dev != d) { dev = d; n = 0; }
+    for (unsigned i = 0; i < n; i++) {
+        if (known[i].family == family) { bool yes = known[i].yes; os_unfair_lock_unlock(&lock); return yes; }
     }
-    BOOL answer = xm2v_device_supports_family(gXm2vDevice, family) ? YES : NO;
-    for (auto &slot : slots) {
-        uint64_t empty = 0;
-        if (slot.compare_exchange_strong(empty, key | (answer ? 1 : 0), std::memory_order_acq_rel) || (empty & ~1ull) == key) break;
-    }
-    return answer;
+    os_unfair_lock_unlock(&lock);
+    bool yes = xm2v_device_supports_family(gXm2vDevice, family);
+    os_unfair_lock_lock(&lock);
+    if (dev == d && n < sizeof(known) / sizeof(known[0])) { known[n].family = family; known[n].yes = yes; n++; }
+    os_unfair_lock_unlock(&lock);
+    return yes;
 }
 static BOOL xcmDev_supportsFamily(id, SEL, MTLGPUFamily family) {
-    if (gXm2vDevice && xcmBridgeSupportsFamily((int64_t)family)) return YES;
+    if (xcmBridgeSupportsFamily((int64_t)family)) return YES;
     // Report Apple1/Apple2, Mac1/Mac2, Common1..3 so QuartzCore enables framebuffer fetch (programmable blending)
     // and standard macOS/Apple GPU paths that lavapipe + metal2vulkan support.
     switch ((int64_t)family) {

@@ -28,7 +28,7 @@ entry, so a CPU beyond the topology is refused (KERN_FAILURE, which XnuCPU logs)
   * 'P' when the host gives every vCPU the same). The AMP scheduler (sched_amp, not Edge: Edge places threads by CLPC's thread group
 --- a/osfmk/arm64/machine_routines.c
 +++ b/osfmk/arm64/machine_routines.c
-@@ -1528,6 +1528,8 @@
+@@ -1527,6 +1527,8 @@
  }
  
  static_assert(MAX_CPUS <= 256, "MAX_CPUS must fit in _COMM_PAGE_CPU_TO_CLUSTER; Increase table size if needed");
@@ -37,7 +37,7 @@ entry, so a CPU beyond the topology is refused (KERN_FAILURE, which XnuCPU logs)
  
  void
  ml_map_cpus_to_clusters(uint8_t *table)
-@@ -1691,6 +1693,14 @@
+@@ -1690,6 +1692,14 @@
      processor_t *processor_out, ipi_handler_t *ipi_handler_out,
      perfmon_interrupt_handler_func *pmi_handler_out)
  {

@@ -296,6 +296,7 @@ private:
     // unmapped descriptor was most of the copy's time.
     struct SurfaceMap {
         IOSurface *surface;   // retained while mapped
+        IOMemoryDescriptor *memory;   // kept prepared while the kernel mapping is cached
         IOMemoryMap *map;
         uint64_t used;
     };
@@ -898,12 +899,12 @@ void XnuDisplay::copyLoop()
     IOLockUnlock(fCopyLock);
 }
 
-// The kernel address of a surface's memory, mapped once for the next copies.
+// The kernel address of a surface's memory, kept prepared and mapped for the next copies.
 const uint8_t *XnuDisplay::surfaceBytes(IOSurface *surface, IOMemoryDescriptor *memory)
 {
     SurfaceMap *slot = &fSurfaceMaps[0];
     for (SurfaceMap &entry : fSurfaceMaps) {
-        if (entry.surface == surface && entry.map->getMemoryDescriptor() == memory) {
+        if (entry.surface == surface && entry.memory == memory) {
             entry.used = ++fSurfaceMapClock;
             return reinterpret_cast<const uint8_t *>(entry.map->getVirtualAddress());
         }
@@ -912,14 +913,21 @@ const uint8_t *XnuDisplay::surfaceBytes(IOSurface *surface, IOMemoryDescriptor *
     }
     if (slot->surface) {
         slot->map->release();
+        slot->memory->complete();
+        slot->memory->release();
         reinterpret_cast<OSObject *>(slot->surface)->release();
         *slot = {};
     }
-    IOMemoryMap *map = memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly);
-    if (!map)
+    if (memory->prepare() != kIOReturnSuccess)
         return nullptr;
+    IOMemoryMap *map = memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly);
+    if (!map) {
+        memory->complete();
+        return nullptr;
+    }
+    memory->retain();
     reinterpret_cast<OSObject *>(surface)->retain();
-    *slot = {surface, map, ++fSurfaceMapClock};
+    *slot = {surface, memory, map, ++fSurfaceMapClock};
     return reinterpret_cast<const uint8_t *>(map->getVirtualAddress());
 }
 
@@ -947,6 +955,8 @@ void XnuDisplay::releaseSurfaceMaps()
         if (!entry.surface)
             continue;
         entry.map->release();
+        entry.memory->complete();
+        entry.memory->release();
         reinterpret_cast<OSObject *>(entry.surface)->release();
         entry = {};
     }
@@ -1145,14 +1155,10 @@ void XnuDisplay::copySurface(IOSurface *surface, bool refresh)
         total += ns;
         mark = now;
     };
-    if (memory->prepare() != kIOReturnSuccess)
-        return;
     const uint8_t *bytes = surfaceBytes(surface, memory);
     lap(fPrepareNs);
-    if (!bytes) {
-        memory->complete();
+    if (!bytes)
         return;
-    }
     uint64_t lit = 0, raw = 0, center = 0;
     bool sample = !refresh;   // bring-up: the first frames and every 50th are logged, the last one goes into the periodic report
     for (uint64_t y = 0; y < copyHeight; y++) {
@@ -1201,7 +1207,6 @@ void XnuDisplay::copySurface(IOSurface *surface, bool refresh)
         memcpy(line, fLine, copyWidth * 4);
         lap(fWriteNs);
     }
-    memory->complete();
     uint64_t ns;
     absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
     fCopies++;

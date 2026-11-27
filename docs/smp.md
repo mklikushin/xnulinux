@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-2.0-only -->
 # Hosted XNU on several CPUs
 
 Today the hosted XNU runs on one CPU: xnu.ko's loading task, bound to Linux CPU 0, enters the XNU world and stays
@@ -8,7 +9,7 @@ decoder in the hosted system), which needs several cores. This is the plan for N
 
 | Where | State | For N CPUs |
 |---|---|---|
-| XNU, the current thread (on hardware `TPIDR_EL1`, which is Linux's per-CPU base while hosted) | A global (`linux64_tpidr`) | Done: `TPIDRRO_EL0` in XNU's kernel (the user TSD is swapped in on return to user space), per CPU by nature |
+| XNU, the current thread (on hardware `TPIDR_EL1`, which is Linux's per-CPU base while hosted) | A global (`linux64_tpidr`) | Done: `TPIDR_EL0` in XNU's kernel (user `TPIDR_EL0` is swapped on EL0 entry/exit and persisted per thread in `linux64_user_tpidr`; user `TPIDRRO_EL0` holds `cthread_self`), per CPU by nature |
 | XNU, the virtual interrupt flag, pending IPI, host-yield clock | Globals | One slot per CPU, found from `MPIDR_EL1` (`LINUX64_CPU_SLOT`); xnu.ko checks at load that its CPUs map to distinct slots. A slot read before code that can block (an urgent AST) is read again after it: the thread can resume on another CPU |
 | xnu.ko, `xnu_W` (`world.S`) | The world-switch save area: Linux's and XNU's callee-saved registers, keys, TTBR0/TCR, TLS | One per CPU, found the same way in `world.S` |
 | xnu.ko, `in_xnu`, the deferred kernel-fault record, `kcount`, the console line buffer, statics in `xnu_hook_body` | Per-run state | Per CPU where it is per CPU (`in_xnu`, the fault record the exception handler leaves for `xnu_fault_tramp`); a spinlock where it is shared (the console buffer) |
@@ -75,5 +76,8 @@ spinning lets the host take the spinning CPU's interrupts (`linux64_spin_relax`,
    - Paravirtual ticket locks (`xnu-patches/0005`): waiters sleep in the host and are kicked; a spinning CPU takes a
      pending IPI as its FIQ would.
    - Linux's device interrupts are kept off XNU's CPUs (`xnulinux-boot.sh`).
+   More than 8 (`xnu-patches/0010`): the virtual board's `MAX_CPUS` was 8 and a ninth CPU faulted in
+   `ml_processor_register`. The limit is now 32 (`LINUX64_MAX_CPUS`, the kernel's and `xnu.ko`'s). Run with 12, 14
+   and 16 CPUs on a 16-vCPU host (desktop, `hw.ncpu` right); more than 16 has not been run.
    Open: the default for `cpus=`; cross-CPU costs (pipe round trip 11.9 µs on 2 CPUs against 3.3 µs on one,
    fork 2.2 ms against 0.97 ms).

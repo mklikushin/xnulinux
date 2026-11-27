@@ -18,6 +18,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 #include <drm/drm.h>
 #include <drm/virtgpu_drm.h>
@@ -312,7 +313,16 @@ int main(int argc, char **argv)
 			perror("read");
 			return 1;
 		}
+		struct timespec t0, t1;
+		if (verbose) clock_gettime(CLOCK_MONOTONIC, &t0);
 		serve(msg, (size_t)n, rep, &rn);
+		if (verbose) {	/* the hosted CPU that made the call waits this long */
+			const struct xnudrm_hdr *h = (const void *)(msg + 8);
+			long ms;
+			clock_gettime(CLOCK_MONOTONIC, &t1);
+			ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+			if (ms >= 20 && h->op != XNUDRM_FENCE_WAIT) fprintf(stderr, "slow: op %u arg0 %#llx of client %u took %ld ms\n", h->op, (unsigned long long)h->arg0, h->client, ms);
+		}
 		if (write(hc, rep, rn) < 0 && errno != ESTALE) perror("write");
 	}
 }

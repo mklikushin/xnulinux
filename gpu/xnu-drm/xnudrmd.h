@@ -11,7 +11,7 @@ extern int verbose;
 /* Physical ranges of a mapping of this process. */
 int xnudrmd_ranges(void *va, size_t len, struct xnudrm_range *rg, uint32_t *nr);
 
-/* Pin a mapping's pages (shared memory only). */
+/* Pin a mapping's pages (shared memory only: -EOPNOTSUPP for a device mapping, which has none to pin). */
 int xnudrmd_pin(void *va, size_t len);
 void xnudrmd_unpin(void *va);
 

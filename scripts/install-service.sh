@@ -7,7 +7,10 @@
 set -euo pipefail
 P=$(cd "$(dirname "$0")/.." && pwd)
 U=$(id -un)
-[ -f /var/tmp/mac.conf ] || { echo "no /var/tmp/mac.conf: make the disk first (scripts/mk-macvm-disk.sh)" >&2; exit 1; }
+# the disk's UUIDs, where the service's xnulinux-boot.sh will look for them: MAC_CONF of /etc/xnulinux.conf (a PureDarwin
+# disk's pd.conf, say), /var/tmp/mac.conf without one
+M=$(unset MAC_CONF; [ -f /etc/xnulinux.conf ] && . /etc/xnulinux.conf >/dev/null; echo "${MAC_CONF:-/var/tmp/mac.conf}")
+(cd "$P" && [ -f "$M" ]) || { echo "no $M: make the disk first (scripts/mk-macvm-disk.sh, scripts/mk-puredarwin-disk.sh)" >&2; exit 1; }
 [ -f /etc/xnulinux.conf ] || sudo tee /etc/xnulinux.conf >/dev/null <<'CONF'
 # The hosted macOS (scripts/xnulinux-boot.sh reads this, then /var/tmp/mac.conf for the disk's UUIDs); the environment
 # overrides what is written as ${NAME:-default}
@@ -16,7 +19,7 @@ RAM_MB=${RAM_MB:-7900}	# its memory, within fki's carve-out
 #DISK=/var/tmp/mac.img
 GPU=${GPU:-auto}	# auto: the host GPU when the VM has a render node; off: CPU rendering only
 #XNU_ARGS="model=VirtualMac2,1"
-#BOOTARGS="amfi_get_out_of_my_way=1 lp-sip0=2050"
+#BOOTARGS="amfi_get_out_of_my_way=1 lp-sip0=2050 bt-transport-override=10"
 CONF
 sudo tee /etc/systemd/system/xnulinux.service >/dev/null <<UNIT
 [Unit]

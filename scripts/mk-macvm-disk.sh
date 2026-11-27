@@ -17,8 +17,9 @@ cd "$(dirname "$0")/.."
 V="bash scripts/vm.sh"
 SRC=${SRC:-$HOME/.tart/vms/xnumac/disk.img}; W=${W:-$PWD/../macvm}; IMG=$W/mac.img
 GPU=${GPU:-$PWD/gpu/xnu-cpu-metal/dist/XnuCpuMetal.bundle}
+# bluetoothd: no Bluetooth controller; it fails to boot the chip and exits, and launchd starts it again every few seconds
 DISABLE="com.apple.watchdogd com.apple.iomfb_bics_daemon com.apple.audiomxd com.apple.audio.coreaudiod com.apple.PerfPowerServices
- com.apple.PerfPowerServicesExtended com.apple.oahd com.apple.oahd-root-helper ${DISABLE:-}"
+ com.apple.PerfPowerServicesExtended com.apple.oahd com.apple.oahd-root-helper com.apple.bluetoothd ${DISABLE:-}"
 # images of ours left attached by an earlier run
 for d in $(hdiutil info -plist | python3 -c 'import plistlib,sys,os
 for i in plistlib.loads(sys.stdin.buffer.read()).get("images", []):
@@ -75,6 +76,13 @@ awake = {"Label": "xnulinux.awake", "RunAtLoad": True,
          "ProgramArguments": ["/usr/bin/pmset", "-a", "displaysleep", "0", "sleep", "0", "disksleep", "0"]}
 p = D + "/Library/LaunchDaemons/xnulinux.awake.plist"
 plistlib.dump(awake, open(p, "wb")); os.chown(p, 0, 0); os.chmod(p, 0o644)
+# Preboot read-write, as apfs_boot_util mounts it on a Mac: the kernel mounts it before launchd (for the cryptexes'
+# contents) and APFS gives the kernel's mount read-only; apfs_boot_util then finds it mounted and leaves it. cryptexd
+# keeps its state there and aborts on a read-only one, every twenty minutes.
+preboot = {"Label": "xnulinux.preboot", "RunAtLoad": True,
+           "ProgramArguments": ["/sbin/mount", "-u", "-o", "rw,nobrowse", "/System/Volumes/Preboot"]}
+p = D + "/Library/LaunchDaemons/xnulinux.preboot.plist"
+plistlib.dump(preboot, open(p, "wb")); os.chown(p, 0, 0); os.chmod(p, 0o644)
 # No screen saver either: after its idle time (no keyboard or pointer input: a hosted system with no one at it) it plays
 # the aerial wallpaper's video, which without the GPU bridge decodes in software and takes both of a two-CPU system's
 # CPUs, then locks the session. The setting is the user's, per host (ByHost, by IOPlatformUUID), so it is made at login.

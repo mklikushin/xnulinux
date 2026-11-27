@@ -53,6 +53,11 @@ int main(void)
 	memcpy(in, &eb, sizeof(eb));
 	if (call(XNUDRM_IOCTL, c, DRM_COMMAND_BASE + DRM_VIRTGPU_EXECBUFFER, 0, sizeof(eb))) return 1;
 	int f = ((struct drm_virtgpu_execbuffer *)out)->fence_fd, i;
+	/* a fence closed without a wait, then the next one in its slot */
+	call(XNUDRM_FENCE_CLOSE, c, f, 0, 0);
+	memcpy(in, &eb, sizeof(eb));
+	if (call(XNUDRM_IOCTL, c, DRM_COMMAND_BASE + DRM_VIRTGPU_EXECBUFFER, 0, sizeof(eb))) return 1;
+	f = ((struct drm_virtgpu_execbuffer *)out)->fence_fd;
 	for (i = 0; i < 20 && call(XNUDRM_FENCE_WAIT, c, f, 50000000, 0); i++) ;
 	call(XNUDRM_FENCE_CLOSE, c, f, 0, 0);
 	struct drm_gem_close gcl = { .handle = h };

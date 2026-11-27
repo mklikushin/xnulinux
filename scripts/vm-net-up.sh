@@ -8,7 +8,9 @@ ip link show xnu0 >/dev/null 2>&1 || { echo "vm-net-up: no xnu0 (fki.ko without 
 sudo ip addr replace 192.168.77.1/24 dev xnu0
 sudo ip link set xnu0 up
 sudo sysctl -q -w net.ipv4.ip_forward=1
-up=$(ip route show default | awk '{print $5; exit}')
+# the default route's interface: the word after "dev", wherever it is ("default dev wg0 scope link" has no gateway before
+# it, and a multipath route names its interfaces on the next-hop lines)
+up=$(ip route show default | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
 sudo iptables -t nat -C POSTROUTING -s 192.168.77.0/24 -o "$up" -j MASQUERADE 2>/dev/null ||
   sudo iptables -t nat -A POSTROUTING -s 192.168.77.0/24 -o "$up" -j MASQUERADE
 sudo iptables -C FORWARD -i xnu0 -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD -i xnu0 -j ACCEPT

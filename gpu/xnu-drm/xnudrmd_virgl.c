@@ -24,15 +24,23 @@
 
 static uint8_t clients[VG_CLIENTS];	/* 0 free, 1 open, 2 with a context (its id is the client's) */
 static struct res { uint32_t client; uint32_t blob_mem; uint64_t size; void *va; uint64_t maplen; int pinned; } res[VG_RES];
-static struct fence { uint32_t client; uint8_t state; } fences[VG_FENCES];	/* 0 free, 1 pending, 2 signalled */
+/*
+ * A client names a fence by its slot. The renderer's id is the slot and a serial number: a fence closed before it
+ * signalled must not signal the slot's next one.
+ */
+static struct fence { uint32_t client; uint8_t state; uint64_t serial; } fences[VG_FENCES];	/* 0 free, 1 pending, 2 signalled */
+static uint64_t fence_serial;
+#define FENCE_ID(slot, serial) (((serial) << 16) | (slot))
 static void *cmdbuf;
 
 static int vgerr(int r) { return r < 0 ? r : r > 0 ? -r : 0; }
 
 static void write_context_fence(void *cookie, uint32_t ctx, uint32_t ring, uint64_t id)
 {
-	if (id && id < VG_FENCES && fences[id].state == 1 && fences[id].client == ctx)
-		fences[id].state = 2;
+	struct fence *f = &fences[id & (VG_FENCES - 1)];
+
+	if (f->state == 1 && f->client == ctx && FENCE_ID(id & (VG_FENCES - 1), f->serial) == id)
+		f->state = 2;
 }
 static void write_fence(void *cookie, uint32_t fence) { }
 
@@ -187,10 +195,11 @@ static int do_ioctl(uint32_t c, uint32_t nr, uint8_t *p, uint32_t plen)
 			if ((r = virgl_renderer_submit_cmd(cmdbuf, c, a->size / 4))) return vgerr(r);
 		}
 		if (id) {
-			fences[id] = (struct fence){ .client = c, .state = 1 };
-			r = virgl_renderer_context_create_fence(c, 0, a->flags & VIRTGPU_EXECBUF_RING_IDX ? a->ring_idx : 0, id);
+			fences[id] = (struct fence){ .client = c, .state = 1, .serial = ++fence_serial };
+			r = virgl_renderer_context_create_fence(c, 0, a->flags & VIRTGPU_EXECBUF_RING_IDX ? a->ring_idx : 0,
+			    FENCE_ID(id, fences[id].serial));
 			if (r) { fences[id] = (struct fence){ 0 }; return vgerr(r); }
-			a->fence_fd = id;	/* the fence's id */
+			a->fence_fd = id;	/* the fence's slot */
 		}
 		return 0;
 	}
@@ -211,9 +220,16 @@ static int do_map(uint32_t c, struct xnudrm_hdr *h, uint8_t *out, uint32_t *outl
 		void *va = NULL;
 		uint64_t maplen = 0;
 		if ((r = virgl_renderer_resource_map(id, &va, &maplen))) return vgerr(r);
+		/* shared memory is pinned: unpinned, Linux could move or reclaim pages the hosted kernel has mapped */
+		r = xnudrmd_pin(va, maplen);
+		if (r && r != -EOPNOTSUPP) {	/* -EOPNOTSUPP: a device mapping, nothing to pin */
+			fprintf(stderr, "xnudrmd: resource %u: its %llu bytes could not be pinned (%d)\n", id, (unsigned long long)maplen, r);
+			virgl_renderer_resource_unmap(id);
+			return r;
+		}
 		rs->va = va;
 		rs->maplen = maplen;
-		rs->pinned = !xnudrmd_pin(va, maplen);	/* shm pages only; device memory cannot be pinned */
+		rs->pinned = !r;
 	}
 	if (len > ((rs->maplen + 4095) & ~(uint64_t)4095)) return -EINVAL;
 	if ((r = xnudrmd_ranges(rs->va, len, (struct xnudrm_range *)out, &nr))) return r;

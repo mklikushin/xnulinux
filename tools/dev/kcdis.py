@@ -16,7 +16,8 @@ for _ in range(ncmds):
             t = tempfile.mkdtemp()
             open(t + '/c.s', 'w').write('.text\n.globl _x\n_x:\n' + ''.join('.inst 0x%08x\n' % w for w in words))
             subprocess.run(['xcrun', 'clang', '-arch', 'arm64e', '-c', t + '/c.s', '-o', t + '/c.o'], check=True)
-            out = subprocess.run(['xcrun', 'llvm-objdump', '-d', '--no-show-raw-insn', '--mattr=+v8.5a,+pauth', t + '/c.o'],
+            # -z: a run of zero words is one '...' line otherwise, and the lines are counted for the addresses below
+            out = subprocess.run(['xcrun', 'llvm-objdump', '-d', '-z', '--no-show-raw-insn', '--mattr=+v8.5a,+pauth', t + '/c.o'],
                                  capture_output=True, text=True).stdout.splitlines()
             k = 0
             for l in out:

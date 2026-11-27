@@ -8,7 +8,7 @@
 #include <IOKit/IOLib.h>
 #include <mach/kmod.h>
 
-// IOGraphicsFamily's abstract accelerator class; kc-build fills the subclass's vtable from it (the JSON's "vtable").
+// IOGraphicsFamily's abstract accelerator class; scripts/kclink fills the subclass's vtable from it (the JSON's "vtable").
 class IOAccelerator : public IOService {
 	OSDeclareAbstractStructors(IOAccelerator)
 };

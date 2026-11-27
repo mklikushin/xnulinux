@@ -117,6 +117,9 @@ Working on two arm64 Linux setups:
   - Currently renders on the CPU (Mesa lavapipe, `GPU=off`): `xnudrmd` only forwards `virtio-gpu` (Venus) ioctls today,
     so hardware GPU pass-through on the GB10 GPU requires a new DRM bridge backend.
 
+Shipping it as a hosted service (what is distributed, what a user installs to run Apple's macOS) is in
+[`docs/hosted-service.md`](docs/hosted-service.md).
+
 What is still a stopgap is listed in [`docs/production.md`](docs/production.md). Notably: the OS cryptex is merged into
 the system volume, AMFI is patched and SIP relaxed, and memory access is slower than a native VM (4K pages vs 16K).
 
@@ -136,7 +139,9 @@ the system volume, AMFI is patched and SIP relaxed, and memory access is slower 
 1. `scripts/vm-xnu-build.sh` (on the arm64 Linux host, once): sets up the macOS-DroidVM Linux toolchain and builds XNU
    (`xnu-12377.121.6`) natively on arm64.
 2. `scripts/vm-xnu-rebuild.sh`: applies `xnu-patches/`, builds the kernel and `kexts/`, and links the kernel collection
-   with Apple's kexts from your macOS installation.
+   with Apple's kexts from your macOS installation (`scripts/kclink`). To link that collection without building
+   anything, `scripts/apple-kc/link.sh`, on the machine that runs `xnu.ko`, takes a kit of the built kernel and kexts
+   and macOS 27.2's kernelcache, read from Apple's IPSW ([docs/free-kc.md](docs/free-kc.md)).
 3. `scripts/mk-macvm-disk.sh` (on the Mac): turns a macOS VM disk made by Apple's installer into the hosted system's disk
    and copies it into the Linux VM.
 4. `scripts/xnulinux-boot.sh` (on the arm64 Linux host): builds `fki.ko` and `xnu.ko` against the running kernel, brings

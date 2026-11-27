@@ -1,6 +1,7 @@
 What macOS 27's userland needs of xnu-12377: the system calls its libsystem_kernel calls (pipe2, dup3, fchflagsat,
 getumask; ENOSYS without SIGSYS for the ones it probes), a vnode table and workqueue limits for a full userland on one
-CPU, and a log line for fatal exceptions and missing system calls.
+CPU, and a log line for fatal exceptions and missing system calls. Other Darwin userlands (PureDarwin) also call vfork,
+which Apple's arm64 configuration leaves out: it is a fork here.
 
 diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
 index 5a7b717..5c12c8f 100644
@@ -64,6 +65,30 @@ index 6e740c2..bfbdd29 100644
  
  	/* consumes reason */
  	return exit_with_reason(p, W_EXITCODE(0, SIGKILL), NULL,
+diff --git a/bsd/kern/kern_fork.c b/bsd/kern/kern_fork.c
+index 1d8db27..06c3a8d 100644
+--- a/bsd/kern/kern_fork.c
++++ b/bsd/kern/kern_fork.c
+@@ -631,6 +631,19 @@ fork(proc_t parent_proc, __unused struct fork_args *uap, int32_t *retval)
+ 	return err;
+ }
+ 
++#if !CONFIG_VFORK
++/*
++ * LINUX64 (xnulinux): vfork, system call 66, which Apple's arm64 kernels leave out (CONFIG_VFORK) but other Darwin
++ * userlands still call (PureDarwin's launchd and launchctl). It is a fork: POSIX lets vfork be one, and libsyscall's
++ * vfork stub reads the same parent/child flag (x1) as fork's.
++ */
++int
++sys_vfork(proc_t parent_proc, __unused struct vfork_args *uap, int32_t *retval)
++{
++	return fork(parent_proc, NULL, retval);
++}
++#endif
++
+ 
+ /*
+  * cloneproc
 diff --git a/bsd/kern/sys_pipe.c b/bsd/kern/sys_pipe.c
 index bd682ab..64d7fa9 100644
 --- a/bsd/kern/sys_pipe.c
@@ -123,9 +148,18 @@ index bd682ab..64d7fa9 100644
  	fp_set_data(wf, wpipe);
  
 diff --git a/bsd/kern/syscalls.master b/bsd/kern/syscalls.master
-index c08a74c..1e26f75 100644
+index c08a74c..9bdafba 100644
 --- a/bsd/kern/syscalls.master
 +++ b/bsd/kern/syscalls.master
+@@ -120,7 +120,7 @@
+ #if CONFIG_VFORK
+ 66	AUE_VFORK	ALL	{ int vfork(void) NO_SYSCALL_STUB; }
+ #else
+-66	AUE_NULL	ALL	{ int nosys(void); }   { old vfork }
++66	AUE_FORK	ALL	{ int sys_vfork(void); }	{ LINUX64 vfork as fork for userlands that call it such as PureDarwin }
+ #endif
+ 67	AUE_NULL	ALL	{ int oslog_coproc_reg(const char *uuid, const char *file_path, size_t file_path_len) NO_SYSCALL_STUB; }
+ 68	AUE_NULL	ALL	{ int oslog_coproc(void *buff, uint64_t buff_len, uint32_t type, const char *uuid, uint64_t timestamp, uint32_t offset, uint32_t stream_log) NO_SYSCALL_STUB; }
 @@ -229,8 +229,8 @@
  145	AUE_NULL	ALL	{ int nosys(void); }   { old setrlimit }
  146	AUE_NULL	ALL	{ int nosys(void); }   { old killpg }

@@ -4,11 +4,11 @@ Patch-License: MIT (provided under the same license as upstream)
 Subject: util: threads Mesa starts leave the hardware-fault signals unblocked
 
 Mesa blocks every signal but SIGSYS and SIGSEGV on the threads it starts (u_thread_create_ex). On Darwin a hardware
-fault whose signal is blocked on the faulting thread is not delivered: the thread runs the same instruction again and
-faults again, forever, at full CPU (tests/hosted/faultmask.c shows it on a Mac). A protection fault there is SIGBUS,
-not SIGSEGV, so a rasteriser thread that jumps to non-executable memory never ends its process: iconservicesagent
-was seen at 100% of a CPU with 150,000 faults a second. With SIGBUS, SIGILL, SIGFPE and SIGTRAP left unblocked the
-process dies with a crash report and launchd starts it again.
+fault whose signal is blocked on the faulting thread is not delivered: the thread runs the same instruction again
+and faults again, forever, at full CPU (gpu/xnu-cpu-metal/test/faultmask.c shows it, on a Mac too). A protection
+fault there is SIGBUS, not SIGSEGV, so a rasteriser thread that jumps to non-executable memory never ends its
+process: iconservicesagent was seen at 100% of a CPU with 150,000 faults a second. With SIGBUS, SIGILL, SIGFPE and
+SIGTRAP left unblocked the process dies with a crash report and launchd starts it again.
 
 --- a/src/util/u_thread.c
 +++ b/src/util/u_thread.c

@@ -36,4 +36,5 @@ int macho_load(struct xnu_image *img, const void *file, unsigned long size, unsi
 int macho_copy(struct xnu_image *img, void *dst);
 int macho_rebase(struct xnu_image *img);
 int macho_slide_header(struct xnu_image *img, u64_t *mh_unslid);
+int macho_va_to_loaded(const struct xnu_image *img, u64_t unslid, u64_t len, u64_t *out_va);
 u64_t macho_sym(struct xnu_image *img, const char *name);	/* runtime address or 0 */

@@ -1,5 +1,0 @@
-# sershell.py xnu272/serial.sock 2-tar-data.cmds --wait-boot   (the restored install itself: tboot.sh, SIP off, a raw payload disk)
-@240 R=/System/Library/Filesystems/apfs.fs/Contents/Resources; $R/apfs_boot_util 1 >/dev/null 2>&1; $R/apfs_boot_util 2 >/dev/null 2>&1; test -d /private/var/db/dslocal/nodes/Default && echo DATA_OK
-RAW=; for d in /dev/disk[0-9]; do [ -e ${d}s1 ] || RAW=/dev/r${d#/dev/}; done; echo raw=$RAW
-@3000 cd /System/Volumes/Data && tar -cf - .TemporaryItems Applications Library System Users Volumes cores home mnt opt pkg private sw usr 2>/var/root/tar.err | dd of=$RAW ibs=65536 obs=1048576 conv=osync 2>&1 | tail -1; cd /; wc -l /var/root/tar.err; head -8 /var/root/tar.err
-sync; echo TAR_DONE

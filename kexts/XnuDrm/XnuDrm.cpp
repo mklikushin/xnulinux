@@ -145,15 +145,28 @@ IOReturn AGXDeviceUserClient::doMap(IOExternalMethodArguments *a)
 	*h = (xnudrm_hdr){ .magic = XNUDRM_MAGIC, .op = XNUDRM_MAP, .client = fClient, .arg0 = handle, .arg1 = size };
 	long n = hostcall(sizeof(*h));
 	xnudrm_hdr *r = (xnudrm_hdr *)gOut;
-	if (n < 0 || r->status) {
+	if (n < (long)sizeof(xnudrm_hdr) || r->status) {
+		int rstatus = (n >= (long)sizeof(xnudrm_hdr)) ? r->status : 0;
 		IOLockUnlock(gCallLock);
-		IOLog("XnuDrm: map of handle %llu failed (%ld, %d)\n", handle, n, n < 0 ? 0 : r->status);
+		IOLog("XnuDrm: map of handle %llu failed (%ld, %d)\n", handle, n, rstatus);
 		return kIOReturnNoMemory;
 	}
 	uint64_t id = r->arg0;
+	size_t avail = (size_t)n - sizeof(xnudrm_hdr);
+	if (r->payload_len != avail || r->payload_len == 0 || (r->payload_len % sizeof(xnudrm_range)) != 0) {
+		IOLockUnlock(gCallLock);
+		xnudrm_hdr ur;
+		simple(XNUDRM_UNMAP, id, 0, &ur);
+		return kIOReturnBadArgument;
+	}
 	uint32_t nr = r->payload_len / sizeof(xnudrm_range);
 	IOAddressRange *ranges = (IOAddressRange *)IOMallocData(nr * sizeof(IOAddressRange));
-	if (!ranges) { IOLockUnlock(gCallLock); return kIOReturnNoMemory; }
+	if (!ranges) {
+		IOLockUnlock(gCallLock);
+		xnudrm_hdr ur;
+		simple(XNUDRM_UNMAP, id, 0, &ur);
+		return kIOReturnNoMemory;
+	}
 	const xnudrm_range *rg = (const xnudrm_range *)(gOut + sizeof(xnudrm_hdr));
 	for (uint32_t i = 0; i < nr; i++) ranges[i] = (IOAddressRange){ rg[i].pa, rg[i].len };
 	IOLockUnlock(gCallLock);
@@ -177,7 +190,13 @@ IOReturn AGXDeviceUserClient::doMap(IOExternalMethodArguments *a)
 	if (i == fNSlots) {
 		unsigned nn = fNSlots ? fNSlots * 2 : 64;
 		Slot *s = (Slot *)IOMallocZeroData(nn * sizeof(Slot));
-		if (!s) { map->release(); md->release(); return kIOReturnNoMemory; }
+		if (!s) {
+			map->release();
+			md->release();
+			xnudrm_hdr ur;
+			simple(XNUDRM_UNMAP, id, 0, &ur);
+			return kIOReturnNoMemory;
+		}
 		if (fSlots) { memcpy(s, fSlots, fNSlots * sizeof(Slot)); IOFreeData(fSlots, fNSlots * sizeof(Slot)); }
 		fSlots = s; fNSlots = nn;
 	}

@@ -56,16 +56,70 @@ static signed char linux_cpu_of_slot[LINUX64_CPU_SLOTS];
 static unsigned long long cpu_mpidr[XNU_MAX_CPUS];
 static void *cpu_thread[XNU_MAX_CPUS];
 static volatile int cpu_running[XNU_MAX_CPUS];
+#define STOP_PARKED_MASK 0x0000ffffu
+#define STOP_ACTIVE_SHIFT 16
+#define STOP_ACTIVE_MASK 0x7fff0000u
+#define STOP_ACTIVE_ONE (1u << STOP_ACTIVE_SHIFT)
+#define STOP_COMMIT 0x80000000u
+static volatile unsigned stop_state = STOP_ACTIVE_ONE;
+static inline int stop_cas(unsigned old, unsigned new);
 static void stop_commit(void);
+static int stop_park(int me);
 static u64_t a_cpu_entry;			/* XNU's linux64_cpu_entry */
-static inline unsigned this_slot(void) { unsigned long m; __asm__ volatile("mrs %0, mpidr_el1" : "=r"(m)); return LINUX64_CPU_SLOT(m); }
+static int el0_mode;				/* nonzero when host reports FKI_CAP_EL0 */
+struct cpu_slot_hot {
+	volatile int in_xnu_state, in_call;
+	unsigned long upcalls, last_call;
+	void *utcb;
+	void *utcb_as;
+	u64_t utcb_thread;
+	u64_t utcb_rop_pid, utcb_jop_pid;
+	int utcb_fpu_live, utcb_disable_jop;
+} __attribute__((aligned(64)));
+static struct cpu_slot_hot cpu_hot[LINUX64_CPU_SLOTS];
+static inline unsigned this_slot(void)
+{
+	if (el0_mode) {
+		unsigned long id;
+		__asm__ volatile("mrs %0, tpidrro_el0" : "=r"(id));
+		return (unsigned)(id & (LINUX64_CPU_SLOTS - 1));
+	}
+	unsigned long m;
+	__asm__ volatile("mrs %0, mpidr_el1" : "=r"(m));
+	return LINUX64_CPU_SLOT(m);
+}
 /* Writing 1 ends the run at XNU's next call into the host; insmod returns and the module can be removed */
 static int stop_run;
 module_param(stop_run, int, 0644);
 static int assert_fatal;	/* 1: a failed XNU assert() ends the run; 0: report it and let XNU continue */
 module_param(assert_fatal, int, 0444);
+static int xo_compat;		/* 1: opt-in fallback relaxing --x to r-x when host lacks FKI_CAP_EXEC_ONLY */
+module_param(xo_compat, int, 0444);
+/*
+ * EL0 KTCB lacks EL1 MRS emulation, so el0_patch_image replaces 2 ID_AA64ISAR0/PFR0_EL1
+ * instructions in com.apple.kec.corecrypto, invalidating its static __TEXT HMAC.
+ * By default (el0_fips_sha256=""), _fipspost_post_integrity is NEVER patched so the real
+ * integrity failure path stays intact. Only when the operator supplies the exact 64-hex
+ * SHA-256 of the unpatched com.apple.kec.corecrypto loaded segments is the integrity check
+ * updated after verifying the digest and that exactly those 2 ID-reg patches were applied.
+ */
+static char *el0_fips_sha256 = "";
+module_param(el0_fips_sha256, charp, 0444);
+
+__attribute__((target("branch-protection=none"), noreturn))
+void xnu_world_pac_abort_el0(int err);
+__attribute__((target("branch-protection=none"), noreturn))
+void xnu_world_pac_abort_el0(int err)
+{
+	static const char msg[] = "xnu: FATAL: fki_pac_swap failed in EL0 upcall\n";
+
+	(void)err;
+	fki_log_alert(msg, sizeof(msg) - 1);
+	BUG();
+}
 
 static struct xnu_image img;
+static struct fki_pac_keys xnu_user_keys;	/* separate PAC key domain for EL0 user contexts */
 static struct fki_region l2page;
 static unsigned long long *window_slot, *window_l1;
 static unsigned char window_owned[512];
@@ -167,7 +221,7 @@ static int run_m1(void)
 	logkv("xnu: threaded fixups applied", (u64_t)n);
 	if (n < 0) return n;
 	u64_t v = macho_sym(&img, "_version"), sl = macho_sym(&img, "_strlen"), cr = macho_sym(&img, "_crc32");
-	if (!v || !sl || !cr) { logs("xnu: symbols missing"); return 0; }
+	if (!v || !sl || !cr) { logs("xnu: symbols missing"); return -2; }
 	c = fki_enter(&xnu_W.xnu_keys, &saved);
 	unsigned long len = ((strlen_fn)sl)((const char *)v);
 	unsigned int crc = ((crc32_fn)cr)(0, (const void *)v, len);
@@ -204,6 +258,10 @@ module_param(model, charp, 0444);
 /* Names for System Information: the chip (/product product-soc-name) and the GPU (the sgx node's "model"). */
 static char *soc_name;
 module_param(soc_name, charp, 0444);
+/* XNU's CPUs (bit c: XNU CPU c) of cluster-type 'E' in the device tree: the host's efficiency cores (e.g. the N1X's
+ * Cortex-A725s), so the AMP scheduler keeps foreground threads on the 'P' ones. 0: every CPU 'P'. */
+static unsigned long ecpus;
+module_param(ecpus, ulong, 0444);
 static char *gpu_model;
 module_param(gpu_model, charp, 0444);
 
@@ -257,8 +315,7 @@ static void walk_log(const char *what, u64_t va, const unsigned long long *l1)
  * Kernel page faults on XNU addresses, taken in Linux's vectors while XNU runs (XNU's keys and stack live), go to
  * XNU's own linux64_kernel_fault (vm_fault on the kernel map). in_xnu is 0 while host code runs (upcalls, monitor).
  */
-static volatile int in_xnu_slot[LINUX64_CPU_SLOTS];
-#define in_xnu in_xnu_slot[this_slot()]
+#define in_xnu cpu_hot[this_slot()].in_xnu_state
 static unsigned long (*xnu_kfault)(unsigned long far, unsigned long esr);
 static unsigned long (*xnu_kfault_recover)(unsigned long pc, unsigned long far, unsigned long esr);
 static unsigned long kfaults;
@@ -362,7 +419,7 @@ static int xnu_fault(unsigned long far, unsigned long esr, void *regs)
 	/*
 	 * An XNU fault nothing resolves (a bug, or a NULL dereference): report it and end the run instead of letting Linux
 	 * oops with XNU's keys and stack live (which takes the machine with it). The exception returns into
-	 * xnu_world_fault_abort, which puts Linux's keys back and leaves through xnu_world_abort.
+	 * xnu_world_fault_abort, which puts Linux's keys back and leaves through xnu_world_abort_mm.
 	 */
 	unsigned long pc = fki_regs_pc(regs);
 	if (pc < XNU_VA_LO || pc >= XNU_VA_HI)
@@ -423,13 +480,26 @@ static int cpu_fn(void *arg)
 	logkv("xnu: XNU CPU starts on Linux CPU", (u64_t)c);
 	if (park_secondaries) {	/* diagnostics: the CPU is asked for but never enters XNU */
 		logkv("xnu: secondary CPU parked (park_secondaries)", (u64_t)c);
+		for (;;) {
+			unsigned s = stop_state;
+			if ((s & STOP_COMMIT) || ((s & STOP_ACTIVE_MASK) <= STOP_ACTIVE_ONE))
+				break;
+			if (stop_cas(s, s - STOP_ACTIVE_ONE))
+				break;
+		}
+		cpu_running[c] = 0;
+		while (!fki_thread_should_stop())
+			fki_msleep(10);
+		return 0;
+	}
+	if (READ_ONCE(stop_run) && stop_park(c)) {
 		cpu_running[c] = 0;
 		while (!fki_thread_should_stop())
 			fki_msleep(10);
 		return 0;
 	}
 	in_xnu = 1;
-	long r = xnu_world_call(a_cpu_entry, cpu_start_arg[c]);
+	long r = el0_mode ? xnu_world_call_el0(a_cpu_entry, cpu_start_arg[c]) : xnu_world_call(a_cpu_entry, cpu_start_arg[c]);
 	in_xnu = 0;
 	if (!r) logkv("xnu: linux64_cpu_entry returned (unexpected) on CPU", (u64_t)c);
 	stop_run = 1;			/* one CPU's run ending (a fatal fault, a stop) ends all of them */
@@ -457,13 +527,24 @@ static inline void acct_add(unsigned long call, u64_t ticks)
 	acct_calls_slot[s][b]++;
 }
 
+_Static_assert(sizeof(struct fki_utcb_regs) == 36 * sizeof(fki_u64), "fki_utcb_regs size");
+_Static_assert(__builtin_offsetof(struct linux64_utcb_req, sp) - __builtin_offsetof(struct linux64_utcb_req, x) ==
+	       __builtin_offsetof(struct fki_utcb_regs, sp), "utcb_req sp offset");
+_Static_assert(__builtin_offsetof(struct linux64_utcb_req, pc) - __builtin_offsetof(struct linux64_utcb_req, x) ==
+	       __builtin_offsetof(struct fki_utcb_regs, pc), "utcb_req pc offset");
+_Static_assert(__builtin_offsetof(struct linux64_utcb_req, pstate) - __builtin_offsetof(struct linux64_utcb_req, x) ==
+	       __builtin_offsetof(struct fki_utcb_regs, pstate), "utcb_req pstate offset");
+_Static_assert(__builtin_offsetof(struct linux64_utcb_req, tpidr) - __builtin_offsetof(struct linux64_utcb_req, x) ==
+	       __builtin_offsetof(struct fki_utcb_regs, tpidr), "utcb_req tpidr offset");
+_Static_assert(__builtin_offsetof(struct linux64_utcb_req, tpidrro) - __builtin_offsetof(struct linux64_utcb_req, x) ==
+	       __builtin_offsetof(struct fki_utcb_regs, tpidrro), "utcb_req tpidrro offset");
+
 /*
  * Stopping the run: the CPUs leave XNU together. A CPU still inside XNU could otherwise wait for good, interrupts masked,
- * for one that had already left. Each parks briefly at its host calls; the run is abandoned once all are parked at once.
- * stop_state: the number of parked CPUs, and STOP_COMMIT once the run is abandoned.
+ * for one that had already left. Each parks briefly at its host calls and kicks the others, so that one idle or in user
+ * space comes to a host call too; the run is abandoned once all active CPUs are parked at once.
+ * stop_state layout: [15:0] parked count, [30:16] active CPU count, [31] STOP_COMMIT.
  */
-#define STOP_COMMIT 0x10000u
-static volatile unsigned stop_state;
 static inline int stop_cas(unsigned old, unsigned new)
 {
 	unsigned cur, fail;
@@ -484,37 +565,54 @@ static void stop_commit(void)
 	unsigned s;
 	do s = stop_state; while (!(s & STOP_COMMIT) && !stop_cas(s, s | STOP_COMMIT));
 }
-static int stop_park(void)	/* 1: the run is abandoned, do not return to XNU */
+static int stop_park(int me)	/* 1: the run is abandoned, do not return to XNU */
 {
-	unsigned s, in_xnu_cpus = 1;
+	unsigned s, last_active;
 	u64_t end;
 
-	for (int c = 1; c < cpus; c++)
-		in_xnu_cpus += cpu_running[c] != 0;
 	do {
 		s = stop_state;
 		if (s & STOP_COMMIT) return 1;
 	} while (!stop_cas(s, s + 1));
+	last_active = (s & STOP_ACTIVE_MASK) >> STOP_ACTIVE_SHIFT;
+	for (int c = 0; c < cpus; c++)
+		if (c != me && (c == 0 || cpu_running[c]))
+			fki_kick_cpu(c);
 	end = fki_counter() + fki_counter_frequency() / 500;	/* 2 ms */
 	for (;;) {
+		unsigned parked, active;
+
 		s = stop_state;
 		if (s & STOP_COMMIT) return 1;
-		if ((s & (STOP_COMMIT - 1)) >= in_xnu_cpus) { stop_cas(s, s | STOP_COMMIT); continue; }
+		parked = s & STOP_PARKED_MASK;
+		active = (s & STOP_ACTIVE_MASK) >> STOP_ACTIVE_SHIFT;
+		if (active != last_active) {
+			last_active = active;
+			for (int c = 0; c < cpus; c++)
+				if (c != me && (c == 0 || cpu_running[c]))
+					fki_kick_cpu(c);
+		}
+		if (parked >= active) { stop_cas(s, s | STOP_COMMIT); continue; }
 		if (fki_counter() > end && stop_cas(s, s - 1)) return 0;
 	}
 }
 
 /* XNU calls into the host: enum linux64_call (linux64_abi.h); a non-zero return ends the run */
 static long xnu_hook_body(unsigned long call, unsigned long a1, unsigned long a2);
-/* each CPU's host calls so far, the last one's number, and whether it is inside one: the monitor's silent-CPU check */
-static unsigned long upcalls_slot[LINUX64_CPU_SLOTS], last_call_slot[LINUX64_CPU_SLOTS];
-static volatile int in_call_slot[LINUX64_CPU_SLOTS];
 long xnu_hook(unsigned long call, unsigned long a1, unsigned long a2)
 {
 	unsigned in_s = this_slot();	/* the thread is bound to its CPU while in the host */
-	upcalls_slot[in_s]++;
-	last_call_slot[in_s] = call;
-	{
+	struct cpu_slot_hot *hot = &cpu_hot[in_s];
+	hot->upcalls++;
+	hot->last_call = call;
+	hot->in_xnu_state = 0;
+	if (*(volatile int *)&stop_run && stop_park(linux_cpu_of_slot[in_s])) {	/* the host asked the run to end (scripts/xnulinux-boot.sh stop): XNU is abandoned here */
+		logs("xnu: run stopped by the host (stop_run)");
+		return 1;
+	}
+	u64_t t0 = 0;
+	int do_perf = unlikely(READ_ONCE(perf));
+	if (do_perf) {
 		/* debugging: an XNU stack Linux's overflow check would reject (bit 14 of sp set) */
 		static int told;
 		unsigned long sp;
@@ -524,29 +622,256 @@ long xnu_hook(unsigned long call, unsigned long a1, unsigned long a2)
 			logkv("xnu: upcall on an XNU stack with sp bit 14 set, sp", sp);
 			logkv("xnu:   call", call);
 		}
+		t0 = fki_counter();
 	}
-	in_xnu = 0;
-	if (*(volatile int *)&stop_run && stop_park()) {	/* the host asked the run to end: XNU is abandoned here */
-		logs("xnu: run stopped by the host (stop_run)");
-		return 1;
-	}
-	u64_t t0 = fki_counter();
-	in_call_slot[in_s] = 1;
+	hot->in_call = 1;
 	long r = xnu_hook_body(call, a1, a2);
-	in_call_slot[in_s] = 0;
-	acct_add(call, fki_counter() - t0);
+	hot->in_call = 0;
+	if (do_perf)
+		acct_add(call, fki_counter() - t0);
 	if (r)
 		stop_commit();		/* this CPU ends the run by itself (a panic, a failed assert) */
-	else if (*(volatile int *)&stop_run && stop_park()) {	/* back from a long call when the stop was asked */
+	else if (*(volatile int *)&stop_run && stop_park(linux_cpu_of_slot[in_s])) {	/* back from a long call when the stop was asked */
 		logs("xnu: run stopped by the host (stop_run)");
 		r = 1;
 	}
-	if (!r) in_xnu = 1;
+	if (!r) hot->in_xnu_state = 1;
 	return r;
+}
+
+static void derive_user_pac_keys(u64_t rop_pid, u64_t jop_pid, int djop,
+				 struct fki_pac_keys *out)
+{
+	struct fki_pac_keys k = xnu_user_keys;
+	u64_t jmix = jop_pid * 0x9e3779b97f4a7c15ULL;
+	u64_t rmix = rop_pid * 0x9e3779b97f4a7c15ULL;
+	k.ia[0] ^= jop_pid; k.ia[1] ^= jmix;
+	k.da[0] ^= jop_pid; k.da[1] ^= jmix;
+	k.ga[0] ^= jop_pid; k.ga[1] ^= jmix;
+	k.ib[0] ^= rop_pid; k.ib[1] ^= rmix;
+	k.db[0] ^= rop_pid; k.db[1] ^= rmix;
+	if (djop)	/* arm64 (not arm64e): all four keys off (EnIA, EnIB, EnDA, EnDB), as linux64_el0_run does at EL1 */
+		k.sctlr_en &= ~((1ULL << 31) | (1ULL << 30) | (1ULL << 27) | (1ULL << 13));
+	*out = k;
+}
+
+static __always_inline u64_t xnu_user_pac_exec(u64_t val, u64_t disc,
+					       unsigned int key, unsigned int is_auth)
+{
+	if (!is_auth) {
+		u64_t out = val;
+		if (key == LINUX64_PAC_KEY_IA)
+			__asm__ volatile(".arch armv8.3-a\n pacia %0, %1" : "+r"(out) : "r"(disc) : "memory");
+		else
+			__asm__ volatile(".arch armv8.3-a\n pacda %0, %1" : "+r"(out) : "r"(disc) : "memory");
+		return out;
+	}
+	/*
+	 * Authenticate without trapping under FEAT_FPAC: strip the PAC, re-sign
+	 * under the active user JOP key, and return the stripped pointer only on
+	 * an exact match (otherwise return an ARMv8.3-A A-key error-tagged ptr).
+	 */
+	u64_t stripped = val;
+	if (key == LINUX64_PAC_KEY_IA)
+		__asm__ volatile(".arch armv8.3-a\n xpaci %0" : "+r"(stripped) : : "memory");
+	else
+		__asm__ volatile(".arch armv8.3-a\n xpacd %0" : "+r"(stripped) : : "memory");
+	u64_t expected = stripped;
+	if (key == LINUX64_PAC_KEY_IA)
+		__asm__ volatile(".arch armv8.3-a\n pacia %0, %1" : "+r"(expected) : "r"(disc) : "memory");
+	else
+		__asm__ volatile(".arch armv8.3-a\n pacda %0, %1" : "+r"(expected) : "r"(disc) : "memory");
+	if (expected == val)
+		return stripped;
+	return (stripped & ~(3ULL << 61)) | (1ULL << 61);
 }
 
 static long xnu_hook_body(unsigned long call, unsigned long a1, unsigned long a2)
 {
+	if (call == LINUX64_CALL_USER_PAC_OP) {
+		struct linux64_user_pac_req *q = (struct linux64_user_pac_req *)a1;
+		if (!q)
+			return 0;
+		struct fki_pac_keys uk, saved, tmp;
+		derive_user_pac_keys(0, q->jop_key, 0, &uk);
+		int perr = fki_pac_swap(&uk, &saved);
+		if (perr != 0) {
+			q->err = perr;
+			return 0;
+		}
+		q->result = xnu_user_pac_exec(q->value, q->discriminator, q->key, q->is_auth);
+		q->err = 0;
+		int rerr = fki_pac_swap(&saved, &tmp);
+		if (rerr != 0) {
+			logs("xnu: failed to restore kernel PAC keys");
+			return 1;
+		}
+		return 0;
+	}
+	if (call == LINUX64_CALL_UTCB_RUN || call == LINUX64_CALL_UTCB_RESUME) {
+		struct linux64_utcb_req *q = (struct linux64_utcb_req *)a1;
+		if (!q || !q->as_handle)
+			return 0;
+		unsigned s = this_slot();
+		struct cpu_slot_hot *hot = &cpu_hot[s];
+		void *as = (void *)(unsigned long)q->as_handle;
+		void *utcb = hot->utcb;
+		int djop = q->disable_jop ? 1 : 0;
+		if (call == LINUX64_CALL_UTCB_RESUME &&
+		    likely(utcb && hot->utcb_thread == q->thread_id && !q->fpu_dirty &&
+			   hot->utcb_as == as && hot->utcb_disable_jop == djop &&
+			   hot->utcb_rop_pid == q->rop_pid && hot->utcb_jop_pid == q->jop_pid)) {
+			struct fki_utcb_stop stop;
+			int err = fki_utcb_resume(utcb, (struct fki_utcb_regs *)&q->x[0], &stop);
+			q->result = err;
+			if (err == 0) {
+				hot->utcb_fpu_live = 1;
+				q->stop_kind = stop.kind;
+				q->fault_addr = stop.fault_addr;
+				q->fault_ip = stop.fault_ip;
+				q->esr = stop.esr;
+			}
+			return 0;
+		}
+		if (call == LINUX64_CALL_UTCB_RESUME) {
+			/*
+			 * The registers of a resume are the ones the host's context holds, not q's (those are from the
+			 * thread's last full stop): when the context is no longer this thread's as it stopped, they are
+			 * gone, and running q's would take the thread back to that stop. XNU keeps the two together
+			 * (linux64_el0_utcb_entry, no preemption in between): say so instead.
+			 */
+			logs_alert("xnu: UTCB_RESUME for a thread whose registers the CPU's user context no longer holds");
+			q->result = -116;	/* -ESTALE */
+			return 0;
+		}
+		if (!utcb) {
+			utcb = fki_utcb_create(as);
+			if (!utcb) {
+				q->result = -12;
+				return 0;
+			}
+			hot->utcb = utcb;
+			hot->utcb_as = as;
+			hot->utcb_thread = 0;
+			hot->utcb_fpu_live = 0;
+			hot->utcb_disable_jop = -1;
+			hot->utcb_rop_pid = ~0ULL;
+			hot->utcb_jop_pid = ~0ULL;
+		} else if (hot->utcb_as != as) {
+			int aerr = fki_utcb_set_as(utcb, as);
+			if (aerr != 0) {
+				q->result = aerr;
+				return 0;
+			}
+			hot->utcb_as = as;
+		}
+		if (hot->utcb_disable_jop != djop ||
+		    hot->utcb_rop_pid != q->rop_pid ||
+		    hot->utcb_jop_pid != q->jop_pid) {
+			struct fki_pac_keys k;
+			derive_user_pac_keys(q->rop_pid, q->jop_pid, djop, &k);
+			int perr = fki_utcb_set_pac(utcb, &k);
+			if (perr != 0) {
+				q->result = perr;
+				return 0;
+			}
+			hot->utcb_disable_jop = djop;
+			hot->utcb_rop_pid = q->rop_pid;
+			hot->utcb_jop_pid = q->jop_pid;
+		}
+		if (q->fpu_dirty || hot->utcb_thread != q->thread_id) {
+			if (!q->neon_ptr) {
+				q->result = -22;
+				return 0;
+			}
+			int ferr = fki_utcb_fpu_write(utcb, (const void *)(unsigned long)q->neon_ptr, 520);
+			if (ferr != 0) {
+				q->result = ferr;
+				return 0;
+			}
+			hot->utcb_thread = q->thread_id;
+			hot->utcb_fpu_live = 0;
+			q->fpu_dirty = 0;
+		}
+		struct fki_utcb_stop stop;
+		int err = fki_utcb_run(utcb, (struct fki_utcb_regs *)&q->x[0], &stop);
+		q->result = err;
+		if (err == 0) {
+			hot->utcb_fpu_live = 1;
+			q->stop_kind = stop.kind;
+			q->fault_addr = stop.fault_addr;
+			q->fault_ip = stop.fault_ip;
+			q->esr = stop.esr;
+		}
+		return 0;
+	}
+	if (call == LINUX64_CALL_UTCB_SYNC_REGS) {
+		struct linux64_utcb_req *q = (struct linux64_utcb_req *)a1;
+		if (!q)
+			return 0;
+		unsigned s = this_slot();
+		struct cpu_slot_hot *hot = &cpu_hot[s];
+		if (unlikely(!hot->utcb)) {
+			q->result = -22;
+			return 0;
+		}
+		q->result = fki_utcb_sync_regs(hot->utcb, (struct fki_utcb_regs *)&q->x[0]);
+		return 0;
+	}
+	if (call == LINUX64_CALL_UTCB_FPU_SYNC) {
+		struct linux64_fpu_sync_req *q = (struct linux64_fpu_sync_req *)a1;
+		if (!q)
+			return 0;
+		unsigned s = this_slot();
+		struct cpu_slot_hot *hot = &cpu_hot[s];
+		q->result = 0;
+		if ((q->flags & LINUX64_FPU_FLUSH) &&
+		    hot->utcb && hot->utcb_thread == q->thread_id && hot->utcb_fpu_live) {
+			if (!q->neon_ptr) {
+				q->result = -22;
+				return 0;
+			}
+			int ferr = fki_utcb_fpu_read(hot->utcb, (void *)(unsigned long)q->neon_ptr, 520);
+			if (ferr != 0) {
+				q->result = ferr;
+				return 0;
+			}
+			hot->utcb_fpu_live = 0;
+		}
+		if ((q->flags & LINUX64_FPU_INVALIDATE) && hot->utcb_thread == q->thread_id) {
+			hot->utcb_fpu_live = 0;
+			hot->utcb_thread = 0;
+		}
+		return 0;
+	}
+	if (call == LINUX64_CALL_AS_MAP) {
+		struct linux64_map_req *q = (struct linux64_map_req *)a1;
+		if (q)
+			q->result = fki_as_map((void *)(unsigned long)q->as_handle, (unsigned long)q->va,
+					       q->pa, (unsigned long)q->size, (int)q->prot);
+		return 0;
+	}
+	if (call == LINUX64_CALL_AS_UNMAP) {
+		struct linux64_map_req *q = (struct linux64_map_req *)a1;
+		if (q) {
+			fki_as_unmap((void *)(unsigned long)q->as_handle, (unsigned long)q->va,
+				     (unsigned long)q->size);
+			q->result = 0;
+		}
+		return 0;
+	}
+	if (call == LINUX64_CALL_AS_FLUSH) {
+		struct linux64_map_req *q = (struct linux64_map_req *)a1;
+		if (q) {
+			fki_as_flush((void *)(unsigned long)q->as_handle);
+			q->result = 0;
+		}
+		return 0;
+	}
+	if (call == LINUX64_CALL_ICACHE_FLUSH) {
+		fki_icache_flush(a1, a2);
+		return 0;
+	}
 	if (call == LINUX64_CALL_CONSOLE_READ) {		/* console input: new bytes of console_in */
 		struct linux64_buf_req *q = (struct linux64_buf_req *)a1;
 		if (!q) return 0;
@@ -681,7 +1006,7 @@ static long xnu_hook_body(unsigned long call, unsigned long a1, unsigned long a2
 		logkv("xnu: probe Mach-O magic", *(volatile unsigned int *)diag_va[1]);
 		logkv("xnu: probe boot args Version", ((volatile struct boot_args_v2 *)diag_va[2])->Version);
 		logkv("xnu: probe ADT word", *(volatile unsigned int *)diag_va[3]);
-		if (diag_va[4]) { volatile unsigned int *pc = (void *)diag_va[4]; unsigned v = *pc; *pc = v; logkv("xnu: probe port_crumb (rw)", v); }
+		if (diag_va[4]) { volatile u64_t *pc = (void *)diag_va[4]; u64_t v = *pc; *pc = v; logkv("xnu: probe port_crumb (rw)", v); }
 		if (diag_va[5]) { unsigned long l = ((unsigned long (*)(const char *))diag_va[5])("xnulinux"); logkv("xnu: probe exec strlen through XNU tables", l); }
 		logs("xnu: probes done");
 	}
@@ -718,9 +1043,8 @@ static long xnu_hook_body(unsigned long call, unsigned long a1, unsigned long a2
 		logkv("xnu: XNU enters user space (EL0); user pc", a1);
 		return 0;
 	}
-	if (call == LINUX64_CALL_HALT) {		/* shutdown or reboot inside the hosted system */
-		logs(a1 ? "xnu: the hosted system restarts: the run ends (the host starts it again if it is set up to)" :
-		    "xnu: the hosted system halted: the run ends");
+	if (call == LINUX64_CALL_HALT) {	/* the hosted system shut down: XNU would spin with this CPU's interrupts masked */
+		logs(a1 ? "xnu: the hosted system asked for a restart: run ended" : "xnu: the hosted system halted: run ended");
 		return 1;
 	}
 	if (call == LINUX64_CALL_PANIC) {
@@ -730,14 +1054,28 @@ static long xnu_hook_body(unsigned long call, unsigned long a1, unsigned long a2
 		logs_alert("xnu: XNU panic:");
 		logs_alert(m);
 		logkv("xnu: panic caller", a2);
+		if (diag_va[4])
+			logkv("xnu: port_crumb", *(volatile u64_t *)diag_va[4]);
 		{	/* the frame-pointer chain from here through XNU's frames (the hook runs on XNU's stack); return addresses
 			 * with their pointer-authentication bits replaced by the kernel's all-ones top */
-			unsigned long *fp = __builtin_frame_address(0);
-			for (i = 0; i < 24 && fp && !((unsigned long)fp & 15) && (unsigned long)fp >> 48 == 0xffff; i++) {
-				unsigned long lr = fp[1] | 0xffffff8000000000ul;
+			unsigned long *fp = el0_mode ? (unsigned long *)xnu_worlds[this_slot()]->xnu_regs[10] : __builtin_frame_address(0);
+			unsigned long fp_lo = el0_mode ? (unsigned long)XNU_VA_LO : 0xffffff8000000000UL;	/* EL0: a stack can be in the aperture, below the image */
+			unsigned long fp_hi = 0xfffffffc00000000UL;
+			for (i = 0; i < 24 && fp && !((unsigned long)fp & 15) &&
+			     (unsigned long)fp >= fp_lo && (unsigned long)fp + 16 <= fp_hi; i++) {
+				fki_u64 w0, w1;
+				if (el0_mode) {
+					if (fki_high_read_u64x2((unsigned long)fp, &w0, &w1) != 0)
+						break;
+				} else {
+					w0 = fp[0];
+					w1 = fp[1];
+				}
+				unsigned long lr = (unsigned long)w1 | 0xffffff8000000000ul;
+				unsigned long *next = (unsigned long *)w0;
 				logkv("xnu:   frame", lr);
-				if ((unsigned long *)fp[0] <= fp) break;
-				fp = (unsigned long *)fp[0];
+				if (next <= fp || (unsigned long)next - (unsigned long)fp > 0x100000UL) break;
+				fp = next;
 			}
 		}
 		return 1;
@@ -748,6 +1086,16 @@ static long xnu_hook_body(unsigned long call, unsigned long a1, unsigned long a2
 		if (c <= 0 || c >= cpus || !cpu_thread[c] || !a2 || cpu_start_arg[c]) {
 			logkv("xnu: XNU asked to start a CPU it was not given, MPIDR", a1);
 			return 0;
+		}
+		for (;;) {
+			unsigned s;
+			if (READ_ONCE(stop_run))
+				return 0;
+			s = stop_state;
+			if (s & STOP_COMMIT)
+				return 0;
+			if (stop_cas(s, s + STOP_ACTIVE_ONE))
+				break;
 		}
 		cpu_running[c] = 1;
 		WRITE_ONCE(cpu_start_arg[c], a2);
@@ -762,6 +1110,61 @@ static long xnu_hook_body(unsigned long call, unsigned long a1, unsigned long a2
 	}
 	if (call == LINUX64_CALL_KERNEL_TABLES)
 		return 0;
+	if (call == LINUX64_CALL_KMAP) {
+		struct linux64_map_req *q = (struct linux64_map_req *)a1;
+		if (q)
+			q->result = fki_high_map((unsigned long)q->va, q->pa, (unsigned long)q->size, (int)q->prot);
+		return 0;
+	}
+	if (call == LINUX64_CALL_KUNMAP) {
+		struct linux64_map_req *q = (struct linux64_map_req *)a1;
+		if (q) {
+			fki_high_unmap((unsigned long)q->va, (unsigned long)q->size);
+			q->result = 0;
+		}
+		return 0;
+	}
+	if (call == LINUX64_CALL_KFLUSH) {
+		fki_high_flush();
+		return 0;
+	}
+	if (call == LINUX64_CALL_KMAP_TXN) {
+		struct linux64_map_req *q = (struct linux64_map_req *)a1;
+		if (q) {
+			if (q->prot == LINUX64_KMAP_TXN_BEGIN) {
+				void *txn = NULL;
+				int err = fki_high_txn_begin((unsigned long)q->va, (unsigned long)q->size, &txn);
+				q->as_handle = (u64_t)(unsigned long)txn;
+				q->result = err;
+			} else if (q->prot == LINUX64_KMAP_TXN_RESTORE) {
+				fki_high_txn_restore((void *)(unsigned long)q->as_handle);
+				q->result = 0;
+			} else if (q->prot == LINUX64_KMAP_TXN_END) {
+				fki_high_txn_end((void *)(unsigned long)q->as_handle);
+				q->result = 0;
+			} else {
+				q->result = -22; /* -EINVAL */
+			}
+		}
+		return 0;
+	}
+	if (call == LINUX64_CALL_AS_CREATE) {
+		struct linux64_map_req *q = (struct linux64_map_req *)a1;
+		if (q) {
+			q->as_handle = (u64_t)(unsigned long)fki_as_create();
+			q->result = q->as_handle ? 0 : -12;
+		}
+		return 0;
+	}
+	if (call == LINUX64_CALL_AS_DESTROY) {
+		struct linux64_map_req *q = (struct linux64_map_req *)a1;
+		if (q && q->as_handle) {
+			fki_as_destroy((void *)(unsigned long)q->as_handle);
+			q->as_handle = 0;
+			q->result = 0;
+		}
+		return 0;
+	}
 	{	/* a call this module does not know (an XNU built against a newer linux64_abi.h): say so once, go on */
 		static unsigned long told;
 		if (told != call) { told = call; logkv("xnu: unknown call from XNU", call); }
@@ -905,7 +1308,7 @@ static struct boot_args_v2 *build_boot(unsigned char *base_va, u64_t phys, u64_t
 		adt_prop_str(&a, "state", c ? "waiting" : "running");
 		adt_prop_u32(&a, "reg", (unsigned)cpu_mpidr[c]);
 		adt_prop_u64(&a, "timebase-frequency", fki_counter_frequency());
-		adt_prop_u32(&a, "cluster-type", 'P');	/* the AMP scheduler wants E/M/P, not SMP */
+		adt_prop_u32(&a, "cluster-type", (ecpus >> c) & 1 ? 'E' : 'P');	/* the AMP scheduler wants E/M/P, not SMP */
 	}
 	adt_node(&a, 1, 0);				/* /defaults: XNU looks these up without checking */
 	adt_prop_str(&a, "name", "defaults");
@@ -1115,7 +1518,7 @@ static int monitor_fn(void *arg)
 			static unsigned long seen[XNU_MAX_CPUS], still[XNU_MAX_CPUS];
 			for (int c = 0; c < cpus && xnu_dbg; c++) {
 				unsigned s = LINUX64_CPU_SLOT(cpu_mpidr[c]);
-				if ((c && !cpu_running[c]) || upcalls_slot[s] != seen[c]) { seen[c] = upcalls_slot[s]; still[c] = 0; continue; }
+				if ((c && !cpu_running[c]) || cpu_hot[s].upcalls != seen[c]) { seen[c] = cpu_hot[s].upcalls; still[c] = 0; continue; }
 				if (++still[c] == 1) {
 					struct xnu_world *w = xnu_worlds[s];
 					unsigned long fp = w->xnu_regs[10];
@@ -1123,27 +1526,38 @@ static int monitor_fn(void *arg)
 						char ab[160]; char *q = ab;
 						put_str(&q, "xnu: XNU CPU "); q = put_dec(q, (unsigned long)c);
 						put_str(&q, " made no host call for 2 s (its Linux CPU held, interrupts masked); last call ");
-						q = put_dec(q, last_call_slot[s]); put_str(&q, in_call_slot[s] ? " (inside it)" : " (back in XNU)");
+						q = put_dec(q, cpu_hot[s].last_call); put_str(&q, cpu_hot[s].in_call ? " (inside it)" : " (back in XNU)");
 						*q = 0;
 						logs_alert(ab);
 					}
 					logkv("xnu: XNU CPU silent for 2 s (no host call), cpu", (u64_t)c);
-					logkv("xnu:   its last host call", last_call_slot[s]);
-					logkv("xnu:   still inside it (1) or back in XNU (0)", in_call_slot[s]);
+					logkv("xnu:   its last host call", cpu_hot[s].last_call);
+					logkv("xnu:   still inside it (1) or back in XNU (0)", cpu_hot[s].in_call);
 					logkv("xnu:   lr at that call", w->xnu_regs[11]);
 					for (int f = 0; f < 16 && fp >= XNU_VA_LO && fp < XNU_VA_HI && !(fp & 7); f++) {
-						logkv("xnu:   frame", ((unsigned long *)fp)[1]);
-						fp = ((unsigned long *)fp)[0];
+						fki_u64 w0, w1;
+						if (el0_mode) {
+							if (fki_high_read_u64x2(fp, &w0, &w1) != 0)
+								break;
+						} else {
+							w0 = ((unsigned long *)fp)[0];
+							w1 = ((unsigned long *)fp)[1];
+						}
+						unsigned long next = (unsigned long)w0;
+						logkv("xnu:   frame", w1);
+						if (next <= fp || next - fp > 0x100000UL) break;
+						fp = next;
 					}
 				}
 			}
 		}
 		if (perf && cpus > 1) {	/* each XNU CPU's host calls so far and the last one's number */
-			char cb[200]; char *q = cb;
+			static char cb[16 + XNU_MAX_CPUS * 42];	/* room for every CPU: two 64-bit decimals and two separators each */
+			char *q = cb;
 			put_str(&q, "xnu: calls");
 			for (int c = 0; c < cpus; c++) {
 				unsigned s = LINUX64_CPU_SLOT(cpu_mpidr[c]);
-				put_str(&q, " "); q = put_dec(q, upcalls_slot[s]); put_str(&q, "/"); q = put_dec(q, last_call_slot[s]);
+				put_str(&q, " "); q = put_dec(q, cpu_hot[s].upcalls); put_str(&q, "/"); q = put_dec(q, cpu_hot[s].last_call);
 			}
 			*q = 0;
 			logs(cb);
@@ -1180,6 +1594,472 @@ static int fb_fn(void *arg)
 	return 0;
 }
 
+/*
+ * Pure EL0 load-time binary patching:
+ *  1. Replace UBSan minimal soft-trap `brk #0xff00` (0xd43fe000) with `nop` (0xd503201f).
+ *  2. Replace EL1 ID register reads (`mrs xN, ID_AA64ISAR0_EL1` / `ID_AA64PFR0_EL1`) found in
+ *     prelinked kexts with `movz xN, #0` (0xd2800000 | rd) so they take the safe baseline path
+ *     without trapping at EL0.
+ */
+#define S_ATTR_PURE_INSTRUCTIONS 0x80000000U
+#define S_ATTR_SOME_INSTRUCTIONS 0x00000400U
+
+static int x_str_bounded_eq(const char *s, u64_t max, const char *lit)
+{
+	u64_t i = 0;
+	while (i < max) {
+		if (s[i] != lit[i])
+			return 0;
+		if (s[i] == 0)
+			return 1;
+		i++;
+	}
+	return 0;
+}
+
+struct el0_va_span {
+	u64_t lo, hi;
+};
+
+static int va_in_spans(const struct el0_va_span *spans, unsigned nspans, u64_t va, u64_t len)
+{
+	if (!len || va + len < va)
+		return 0;
+	for (unsigned i = 0; i < nspans; i++) {
+		if (va >= spans[i].lo && va + len <= spans[i].hi)
+			return 1;
+	}
+	return 0;
+}
+
+#define XNU_LC_OK(l, end) \
+	((const char *)(end) - (const char *)(l) >= (long)sizeof(struct lc) && \
+	 (l)->cmdsize >= sizeof(struct lc) && \
+	 (l)->cmdsize <= (u64_t)((const char *)(end) - (const char *)(l)))
+
+static int va_in_loaded_segs_prot(const struct xnu_image *im, u64_t va, u64_t len, u32_t req_prot)
+{
+	if (!len || va + len < va)
+		return 0;
+	const struct mh64 *mh = (const void *)im->file;
+	const struct lc *l = (const void *)(im->file + sizeof(*mh));
+	const struct lc *end = (const void *)(im->file + sizeof(*mh) + mh->sizeofcmds);
+	for (u32_t ci = 0; ci < mh->ncmds && XNU_LC_OK(l, end);
+	     ci++, l = (const void *)((const char *)l + l->cmdsize)) {
+		if (l->cmd != LC_SEGMENT_64 || l->cmdsize < sizeof(struct seg64))
+			continue;
+		const struct seg64 *s = (const void *)l;
+		if (!x_strncmp(s->segname, "__PAGEZERO", 16))
+			continue;
+		/* Writable segments include zero-filled BSS (vmsize > filesize). */
+		u64_t span = (s->initprot & 2) ? s->vmsize : s->filesize;
+		if (!span || (s->initprot & req_prot) != req_prot)
+			continue;
+		u64_t lo;
+		if (!macho_va_to_loaded(im, s->vmaddr, span, &lo))
+			continue;
+		u64_t hi = lo + span;
+		if (va >= lo && va + len <= hi)
+			return 1;
+	}
+	return 0;
+}
+
+static int va_in_loaded_segs(const struct xnu_image *im, u64_t va, u64_t len)
+{
+	return va_in_loaded_segs_prot(im, va, len, 1);
+}
+
+/* Minimal self-contained SHA-256 (FIPS 180-4) for corecrypto pre-patch verification. */
+struct el0_sha256_ctx {
+	u32_t h[8];
+	u64_t bits;
+	unsigned char buf[64];
+	unsigned n;
+};
+
+static inline u32_t sha256_rotr(u32_t x, unsigned r) { return (x >> r) | (x << (32 - r)); }
+
+static void sha256_compress(u32_t h[8], const unsigned char blk[64])
+{
+	static const u32_t K[64] = {
+		0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U, 0x3956c25bU, 0x59f111f1U, 0x923f82a4U, 0xab1c5ed5U,
+		0xd807aa98U, 0x12835b01U, 0x243185beU, 0x550c7dc3U, 0x72be5d74U, 0x80deb1feU, 0x9bdc06a7U, 0xc19bf174U,
+		0xe49b69c1U, 0xefbe4786U, 0x0fc19dc6U, 0x240ca1ccU, 0x2de92c6fU, 0x4a7484aaU, 0x5cb0a9dcU, 0x76f988daU,
+		0x983e5152U, 0xa831c66dU, 0xb00327c8U, 0xbf597fc7U, 0xc6e00bf3U, 0xd5a79147U, 0x06ca6351U, 0x14292967U,
+		0x27b70a85U, 0x2e1b2138U, 0x4d2c6dfcU, 0x53380d13U, 0x650a7354U, 0x766a0abbU, 0x81c2c92eU, 0x92722c85U,
+		0xa2bfe8a1U, 0xa81a664bU, 0xc24b8b70U, 0xc76c51a3U, 0xd192e819U, 0xd6990624U, 0xf40e3585U, 0x106aa070U,
+		0x19a4c116U, 0x1e376c08U, 0x2748774cU, 0x34b0bcb5U, 0x391c0cb3U, 0x4ed8aa4aU, 0x5b9cca4fU, 0x682e6ff3U,
+		0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U, 0x90befffaU, 0xa4506cebU, 0xbef9a3f7U, 0xc67178f2U,
+	};
+	u32_t w[64], a, b, c, d, e, f, g, hh;
+	for (unsigned i = 0; i < 16; i++)
+		w[i] = ((u32_t)blk[i * 4] << 24) | ((u32_t)blk[i * 4 + 1] << 16) |
+		       ((u32_t)blk[i * 4 + 2] << 8) | (u32_t)blk[i * 4 + 3];
+	for (unsigned i = 16; i < 64; i++) {
+		u32_t s0 = sha256_rotr(w[i - 15], 7) ^ sha256_rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+		u32_t s1 = sha256_rotr(w[i - 2], 17) ^ sha256_rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+		w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+	}
+	a = h[0]; b = h[1]; c = h[2]; d = h[3]; e = h[4]; f = h[5]; g = h[6]; hh = h[7];
+	for (unsigned i = 0; i < 64; i++) {
+		u32_t S1 = sha256_rotr(e, 6) ^ sha256_rotr(e, 11) ^ sha256_rotr(e, 25);
+		u32_t ch = (e & f) ^ ((~e) & g);
+		u32_t t1 = hh + S1 + ch + K[i] + w[i];
+		u32_t S0 = sha256_rotr(a, 2) ^ sha256_rotr(a, 13) ^ sha256_rotr(a, 22);
+		u32_t maj = (a & b) ^ (a & c) ^ (b & c);
+		u32_t t2 = S0 + maj;
+		hh = g; g = f; f = e; e = d + t1;
+		d = c; c = b; b = a; a = t1 + t2;
+	}
+	h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+}
+
+static void sha256_init(struct el0_sha256_ctx *ctx)
+{
+	ctx->h[0] = 0x6a09e667U; ctx->h[1] = 0xbb67ae85U; ctx->h[2] = 0x3c6ef372U; ctx->h[3] = 0xa54ff53aU;
+	ctx->h[4] = 0x510e527fU; ctx->h[5] = 0x9b05688cU; ctx->h[6] = 0x1f83d9abU; ctx->h[7] = 0x5be0cd19U;
+	ctx->bits = 0;
+	ctx->n = 0;
+}
+
+static void sha256_update(struct el0_sha256_ctx *ctx, const unsigned char *p, u64_t len)
+{
+	ctx->bits += len * 8;
+	while (len > 0) {
+		unsigned take = (unsigned)(64 - ctx->n);
+		if (take > len)
+			take = (unsigned)len;
+		x_memcpy(ctx->buf + ctx->n, p, take);
+		ctx->n += take;
+		p += take;
+		len -= take;
+		if (ctx->n == 64) {
+			sha256_compress(ctx->h, ctx->buf);
+			ctx->n = 0;
+		}
+	}
+}
+
+static void sha256_final(struct el0_sha256_ctx *ctx, unsigned char out[32])
+{
+	ctx->buf[ctx->n++] = 0x80;
+	if (ctx->n > 56) {
+		while (ctx->n < 64)
+			ctx->buf[ctx->n++] = 0;
+		sha256_compress(ctx->h, ctx->buf);
+		ctx->n = 0;
+	}
+	while (ctx->n < 56)
+		ctx->buf[ctx->n++] = 0;
+	for (unsigned i = 0; i < 8; i++)
+		ctx->buf[56 + i] = (unsigned char)(ctx->bits >> (56 - i * 8));
+	sha256_compress(ctx->h, ctx->buf);
+	for (unsigned i = 0; i < 8; i++) {
+		out[i * 4 + 0] = (unsigned char)(ctx->h[i] >> 24);
+		out[i * 4 + 1] = (unsigned char)(ctx->h[i] >> 16);
+		out[i * 4 + 2] = (unsigned char)(ctx->h[i] >> 8);
+		out[i * 4 + 3] = (unsigned char)(ctx->h[i]);
+	}
+}
+
+static int parse_sha256_hex(const char *s, unsigned char out[32])
+{
+	if (!s)
+		return 0;
+	for (unsigned i = 0; i < 32; i++) {
+		unsigned char v = 0;
+		for (unsigned k = 0; k < 2; k++) {
+			char c = s[i * 2 + k];
+			unsigned char d;
+			if (c >= '0' && c <= '9') d = (unsigned char)(c - '0');
+			else if (c >= 'a' && c <= 'f') d = (unsigned char)(c - 'a' + 10);
+			else if (c >= 'A' && c <= 'F') d = (unsigned char)(c - 'A' + 10);
+			else return 0;
+			v = (unsigned char)((v << 4) | d);
+		}
+		out[i] = v;
+	}
+	return s[64] == '\0';
+}
+
+static int ct_memeq32(const unsigned char a[32], const unsigned char b[32])
+{
+	unsigned char diff = 0;
+	for (unsigned i = 0; i < 32; i++)
+		diff |= (unsigned char)(a[i] ^ b[i]);
+	return diff == 0;
+}
+
+static void log_sha256(const char *prefix, const unsigned char d[32])
+{
+	static const char hex[] = "0123456789abcdef";
+	char line[160];
+	unsigned p = 0;
+	while (prefix[p] && p < 80) {
+		line[p] = prefix[p];
+		p++;
+	}
+	for (unsigned i = 0; i < 32; i++) {
+		line[p++] = hex[d[i] >> 4];
+		line[p++] = hex[d[i] & 0xf];
+	}
+	line[p++] = '\n';
+	fki_log(line, p);
+}
+
+static void el0_patch_macho_sections(const struct xnu_image *im, const struct mh64 *mh,
+				     const struct el0_va_span *cc_sects, unsigned cc_nsects,
+				     u64_t *n_ubsan, u64_t *n_idreg,
+				     u64_t *n_cc_idreg, u64_t *n_cc_ubsan)
+{
+	const char *file = (const char *)im->file;
+	u64_t file_size = im->file_size;
+	u64_t mh_off = (u64_t)((const char *)mh - file);
+	if (mh_off > file_size || file_size - mh_off < sizeof(*mh) ||
+	    mh->magic != MH_MAGIC_64 ||
+	    mh->sizeofcmds > file_size - mh_off - sizeof(*mh) ||
+	    mh->ncmds > mh->sizeofcmds / sizeof(struct lc))
+		return;
+	const struct lc *l = (const void *)(mh + 1);
+	const struct lc *end = (const void *)((const char *)l + mh->sizeofcmds);
+	for (u32_t ci = 0; ci < mh->ncmds && XNU_LC_OK(l, end);
+	     ci++, l = (const void *)((const char *)l + l->cmdsize)) {
+		if (l->cmd != LC_SEGMENT_64 || l->cmdsize < sizeof(struct seg64))
+			continue;
+		const struct seg64 *s = (const void *)l;
+		if (!s->vmsize || !(s->initprot & 4))
+			continue;
+		if ((u64_t)s->nsects > (l->cmdsize - sizeof(*s)) / sizeof(struct sect64))
+			continue;
+		const struct sect64 *sc = (const void *)(s + 1);
+		for (u32_t si = 0; si < s->nsects; si++) {
+			if (!(sc[si].flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS)))
+				continue;
+			if (!sc[si].size || sc[si].addr < s->vmaddr ||
+			    sc[si].addr - s->vmaddr > s->vmsize ||
+			    sc[si].size > s->vmsize - (sc[si].addr - s->vmaddr))
+				continue;
+			u64_t sec_va;
+			if (!macho_va_to_loaded(im, sc[si].addr, sc[si].size, &sec_va) ||
+			    (sec_va & 3) ||
+			    !va_in_loaded_segs(im, sec_va, sc[si].size))
+				continue;
+			u32_t *ins = (u32_t *)sec_va;
+			u64_t cnt = sc[si].size / 4;
+			for (u64_t i = 0; i < cnt; i++) {
+				u32_t w = ins[i];
+				if (w == 0xd43fe000U) {			/* brk #0xff00 */
+					u64_t va = (u64_t)&ins[i];
+					ins[i] = 0xd503201fU;		/* nop */
+					__asm__ volatile("dc cvau, %0\n\tdsb ish\n\tic ivau, %0" : : "r"(&ins[i]) : "memory");
+					if (va_in_spans(cc_sects, cc_nsects, va, 4))
+						(*n_cc_ubsan)++;
+					(*n_ubsan)++;
+				} else if ((w & 0xffffffe0U) == 0xd5380600U ||	/* mrs xN, ID_AA64ISAR0_EL1 */
+					   (w & 0xffffffe0U) == 0xd5380400U) {	/* mrs xN, ID_AA64PFR0_EL1 */
+					u32_t rd = w & 0x1fU;
+					u64_t va = (u64_t)&ins[i];
+					ins[i] = 0xd2800000U | rd;	/* movz xN, #0 */
+					__asm__ volatile("dc cvau, %0\n\tdsb ish\n\tic ivau, %0" : : "r"(&ins[i]) : "memory");
+					if (va_in_spans(cc_sects, cc_nsects, va, 4))
+						(*n_cc_idreg)++;
+					if (*n_idreg < 16) {
+						logkv("xnu: EL0 patched ID-reg mrs at", va);
+						logkv("xnu:   original insn", w);
+					}
+					(*n_idreg)++;
+				}
+			}
+		}
+	}
+}
+
+static void el0_patch_image(struct xnu_image *im)
+{
+	const struct mh64 *mh = (const void *)im->file;
+	const struct lc *l = (const void *)(im->file + sizeof(*mh));
+	const struct lc *end = (const void *)(im->file + sizeof(*mh) + mh->sizeofcmds);
+	u64_t n_ubsan = 0, n_idreg = 0, n_cc_idreg = 0, n_cc_ubsan = 0;
+	struct el0_va_span cc_sects[32];
+	unsigned cc_nsects = 0;
+	int cc_sects_overflow = 0;
+	const struct fileset_entry_lc *cc_fe = 0;
+	unsigned char cc_digest[32];
+	int have_cc_digest = 0;
+
+	/* Locate com.apple.kec.corecrypto executable sections & hash unpatched loaded bytes. */
+	if (im->filetype == MH_FILESET) {
+		u32_t fi = 0;
+		for (const struct lc *fl = l; fi < mh->ncmds && XNU_LC_OK(fl, end);
+		     fi++, fl = (const void *)((const char *)fl + fl->cmdsize)) {
+			if (fl->cmd != LC_FILESET_ENTRY || fl->cmdsize < sizeof(struct fileset_entry_lc))
+				continue;
+			const struct fileset_entry_lc *fe = (const void *)fl;
+			if (fe->entry_id >= fe->cmdsize ||
+			    !x_str_bounded_eq((const char *)fe + fe->entry_id,
+					      fe->cmdsize - fe->entry_id,
+					      "com.apple.kec.corecrypto"))
+				continue;
+			if (fe->fileoff > im->file_size || im->file_size - fe->fileoff < sizeof(*mh))
+				break;
+			const struct mh64 *cmh = (const void *)(im->file + fe->fileoff);
+			if (cmh->magic != MH_MAGIC_64 ||
+			    cmh->sizeofcmds > im->file_size - fe->fileoff - sizeof(*cmh) ||
+			    cmh->ncmds > cmh->sizeofcmds / sizeof(struct lc))
+				break;
+			cc_fe = fe;
+			struct el0_sha256_ctx sctx;
+			sha256_init(&sctx);
+			int hash_ok = 1;
+			const struct lc *cl = (const void *)(cmh + 1);
+			const struct lc *cend = (const void *)((const char *)cl + cmh->sizeofcmds);
+			for (u32_t ci = 0; ci < cmh->ncmds && XNU_LC_OK(cl, cend);
+			     ci++, cl = (const void *)((const char *)cl + cl->cmdsize)) {
+				if (cl->cmd != LC_SEGMENT_64 || cl->cmdsize < sizeof(struct seg64))
+					continue;
+				const struct seg64 *cs = (const void *)cl;
+				if (cs->filesize) {
+					u64_t seg_va;
+					if (!macho_va_to_loaded(im, cs->vmaddr, cs->filesize, &seg_va) ||
+					    !va_in_loaded_segs(im, seg_va, cs->filesize)) {
+						hash_ok = 0;
+					} else {
+						sha256_update(&sctx, (const unsigned char *)seg_va, cs->filesize);
+					}
+				}
+				if (!(cs->initprot & 4) || !cs->vmsize)
+					continue;
+				if ((u64_t)cs->nsects > (cl->cmdsize - sizeof(*cs)) / sizeof(struct sect64))
+					continue;
+				const struct sect64 *csc = (const void *)(cs + 1);
+				for (u32_t si = 0; si < cs->nsects; si++) {
+					if (!(csc[si].flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS)))
+						continue;
+					if (!csc[si].size || csc[si].addr < cs->vmaddr ||
+					    csc[si].addr - cs->vmaddr > cs->vmsize ||
+					    csc[si].size > cs->vmsize - (csc[si].addr - cs->vmaddr))
+						continue;
+					u64_t lo;
+					if (!macho_va_to_loaded(im, csc[si].addr, csc[si].size, &lo) ||
+					    !va_in_loaded_segs(im, lo, csc[si].size))
+						continue;
+					u64_t hi = lo + csc[si].size;
+					if (cc_nsects < sizeof(cc_sects) / sizeof(cc_sects[0])) {
+						cc_sects[cc_nsects].lo = lo;
+						cc_sects[cc_nsects].hi = hi;
+						cc_nsects++;
+					} else {
+						cc_sects_overflow = 1;
+					}
+				}
+			}
+			if (hash_ok) {
+				sha256_final(&sctx, cc_digest);
+				have_cc_digest = 1;
+				log_sha256("xnu: EL0 corecrypto unpatched sha256: ", cc_digest);
+			}
+			break;
+		}
+	}
+
+	/* Scan ONLY executable code sections (S_ATTR_PURE/SOME_INSTRUCTIONS), never data. */
+	if (im->filetype == MH_FILESET) {
+		u32_t fi = 0;
+		for (const struct lc *fl = l; fi < mh->ncmds && XNU_LC_OK(fl, end);
+		     fi++, fl = (const void *)((const char *)fl + fl->cmdsize)) {
+			if (fl->cmd != LC_FILESET_ENTRY || fl->cmdsize < sizeof(struct fileset_entry_lc))
+				continue;
+			const struct fileset_entry_lc *fe = (const void *)fl;
+			if (fe->fileoff > im->file_size || im->file_size - fe->fileoff < sizeof(*mh))
+				continue;
+			el0_patch_macho_sections(im, (const void *)(im->file + fe->fileoff),
+						 cc_sects, cc_nsects,
+						 &n_ubsan, &n_idreg, &n_cc_idreg, &n_cc_ubsan);
+		}
+	} else {
+		el0_patch_macho_sections(im, mh, cc_sects, cc_nsects,
+					 &n_ubsan, &n_idreg, &n_cc_idreg, &n_cc_ubsan);
+	}
+	__asm__ volatile("dsb ish\n\tisb" : : : "memory");
+	logkv("xnu: EL0 patched brk #0xff00 -> nop count", n_ubsan);
+	logkv("xnu: EL0 patched ID-reg mrs -> movz count", n_idreg);
+	logkv("xnu: EL0 corecrypto ID-reg patches", n_cc_idreg);
+
+	/*
+	 * Preserve _fipspost_post_integrity failure path by default. Only update it when the
+	 * operator explicitly provides el0_fips_sha256 matching the pre-patch SHA-256 of
+	 * com.apple.kec.corecrypto's loaded segments, exactly 2 approved ID-reg instructions
+	 * (and 0 other instructions) were patched in corecrypto, and the symbol lies in a
+	 * corecrypto executable section + loaded top-level segment with a valid prologue.
+	 */
+	unsigned char want_digest[32];
+	int fips_digest_ok = (have_cc_digest &&
+			      parse_sha256_hex(el0_fips_sha256, want_digest) &&
+			      ct_memeq32(cc_digest, want_digest));
+	if (fips_digest_ok && cc_fe && !cc_sects_overflow && n_cc_idreg == 2 && n_cc_ubsan == 0) {
+		const struct mh64 *cmh = (const void *)(im->file + cc_fe->fileoff);
+		const struct lc *cl = (const void *)(cmh + 1);
+		const struct lc *cend = (const void *)((const char *)cl + cmh->sizeofcmds);
+		for (u32_t ci = 0; ci < cmh->ncmds && XNU_LC_OK(cl, cend);
+		     ci++, cl = (const void *)((const char *)cl + cl->cmdsize)) {
+			if (cl->cmd != LC_SYMTAB || cl->cmdsize < sizeof(struct symtab_lc))
+				continue;
+			const struct symtab_lc *st = (const void *)cl;
+			if ((u64_t)st->symoff > im->file_size ||
+			    (u64_t)st->nsyms > (im->file_size - st->symoff) / sizeof(struct nlist64) ||
+			    (u64_t)st->stroff > im->file_size ||
+			    (u64_t)st->strsize > im->file_size - st->stroff)
+				break;
+			const struct nlist64 *nl = (const void *)(im->file + st->symoff);
+			const char *strs = (const char *)(im->file + st->stroff);
+			for (u32_t j = 0; j < st->nsyms; j++) {
+				if ((nl[j].n_type & 0xe0) || !nl[j].n_value || nl[j].n_strx >= st->strsize)
+					continue;
+				if (x_str_bounded_eq(strs + nl[j].n_strx,
+						     st->strsize - nl[j].n_strx,
+						     "_fipspost_post_integrity")) {
+					u64_t fn_va;
+					if (!macho_va_to_loaded(im, nl[j].n_value, 12, &fn_va) ||
+					    (fn_va & 3) ||
+					    !va_in_spans(cc_sects, cc_nsects, fn_va, 12) ||
+					    !va_in_loaded_segs(im, fn_va, 12)) {
+						logs("xnu: skipping _fipspost_post_integrity patch (outside corecrypto exec section)");
+						break;
+					}
+					u32_t *fn = (u32_t *)fn_va;
+					u32_t p0 = fn[0];
+					/* Expect bti c (0xd503245f), pacibsp (0xd503237f), stp, or sub sp. */
+					if (p0 == 0xd503245fU || p0 == 0xd503237fU ||
+					    (p0 & 0xffc003ffU) == 0xd10003ffU ||
+					    (p0 & 0x7e000000U) == 0x28000000U) {
+						fn[0] = 0xd503245fU;	/* bti c */
+						fn[1] = 0x52800000U;	/* mov w0, #0 */
+						fn[2] = 0xd65f03c0U;	/* ret */
+						for (int k = 0; k < 3; k++)
+							__asm__ volatile("dc cvau, %0\n\tdsb ish\n\tic ivau, %0" : : "r"(&fn[k]) : "memory");
+						__asm__ volatile("dsb ish\n\tisb" : : : "memory");
+						logkv("xnu: EL0 verified sha256 and patched _fipspost_post_integrity at", fn_va);
+					} else {
+						logkv("xnu: unexpected _fipspost_post_integrity prologue", p0);
+					}
+					break;
+				}
+			}
+			break;
+		}
+	} else if (cc_fe && (n_cc_idreg > 0 || n_cc_ubsan > 0 || cc_sects_overflow)) {
+		if (cc_sects_overflow)
+			logs("xnu: preserving _fipspost_post_integrity (corecrypto exec section table overflow)");
+		else if (!el0_fips_sha256 || !el0_fips_sha256[0])
+			logs("xnu: preserving _fipspost_post_integrity (el0_fips_sha256 not set)");
+		else if (!fips_digest_ok)
+			logs("xnu: preserving _fipspost_post_integrity (el0_fips_sha256 mismatch or invalid hex)");
+		else
+			logkv("xnu: preserving _fipspost_post_integrity (unexpected corecrypto ubsan patches)", n_cc_ubsan);
+	}
+}
+
 static int enter_arm_init(struct boot_args_v2 *ba)
 {
 	if (img.filetype == MH_FILESET) {
@@ -1197,18 +2077,79 @@ static int enter_arm_init(struct boot_args_v2 *ba)
 		int segs = macho_slide_header(&img, &mh_unslid);
 		logkv("xnu: load commands slid (segments)", (u64_t)segs);
 	}
+	if (el0_mode)
+		el0_patch_image(&img);
 	u64_t a_init = macho_sym(&img, "_arm_init"), a_hook = macho_sym(&img, "_linux64_hook"),
-	      a_slide = macho_sym(&img, "_linux64_slide");
+	      a_slide = macho_sym(&img, "_linux64_slide"), a_el0 = macho_sym(&img, "_linux64_el0"),
+	      a_el0_caps = macho_sym(&img, "_linux64_el0_caps"),
+	      a_abi = macho_sym(&img, "_linux64_abi_version"),
+	      a_host_abi = macho_sym(&img, "_linux64_host_abi_version");
 	logkv("xnu: arm_init at", a_init);
 	if (!a_init || !a_hook || !a_slide) { logs("xnu: arm_init or linux64_hook missing (kernel without the LINUX64 patch?)"); return -2; }
-	*(u64_t *)a_hook = (u64_t)xnu_world_upcall;
+	if ((a_init & 3) || !va_in_loaded_segs_prot(&img, a_init, 4, 5) ||
+	    (a_hook & 7) || !va_in_loaded_segs_prot(&img, a_hook, 8, 3) ||
+	    (a_slide & 7) || !va_in_loaded_segs_prot(&img, a_slide, 8, 3)) {
+		logs("xnu: invalid boot symbol address or segment permissions");
+		return -22;
+	}
+	if (!a_abi || (a_abi & 3) || !va_in_loaded_segs_prot(&img, a_abi, 4, 1)) {
+		logs("xnu: _linux64_abi_version missing or invalid (stale kernel incompatible with host ABI)");
+		return -22;
+	}
+	if (*(unsigned int *)a_abi != LINUX64_ABI_VERSION) {
+		logkv("xnu: LINUX64_ABI_VERSION mismatch: kernel has", *(unsigned int *)a_abi);
+		logkv("xnu: LINUX64_ABI_VERSION expected by host", LINUX64_ABI_VERSION);
+		return -22;
+	}
+	if (!a_host_abi || (a_host_abi & 3) || !va_in_loaded_segs_prot(&img, a_host_abi, 4, 3)) {
+		logs("xnu: _linux64_host_abi_version missing or invalid (stale kernel incompatible with host ABI)");
+		return -22;
+	}
+	*(unsigned int *)a_host_abi = LINUX64_ABI_VERSION;
+	if (el0_mode) {
+		if (!a_el0 || !a_el0_caps ||
+		    (a_el0 & 3) || !va_in_loaded_segs_prot(&img, a_el0, 4, 3) ||
+		    (a_el0_caps & 3) || !va_in_loaded_segs_prot(&img, a_el0_caps, 4, 3)) {
+			logs("xnu: _linux64_el0 or _linux64_el0_caps missing or invalid (kernel without EL0 patch?)");
+			return -2;
+		}
+		*(unsigned int *)a_el0 = 1;
+		unsigned int caps = (fki_caps() & FKI_CAP_EXEC_ONLY) ? LINUX64_EL0_CAP_EXEC_ONLY : 0;
+		if (xo_compat)
+			caps |= LINUX64_EL0_CAP_XO_COMPAT;
+		*(unsigned int *)a_el0_caps = caps;
+	}
+	*(u64_t *)a_hook = (u64_t)(el0_mode ? xnu_world_upcall_el0 : xnu_world_upcall);
 	*(u64_t *)a_slide = img.slide;
 
 	diag_va[0] = a_init; diag_va[1] = img.vmlow; diag_va[2] = (u64_t)ba; diag_va[3] = (u64_t)ba->deviceTreeP;
 	diag_va[4] = macho_sym(&img, "_port_crumb");
+	if (diag_va[4] && ((diag_va[4] & 7) || !va_in_loaded_segs_prot(&img, diag_va[4], 8, 3))) {
+		logs("xnu: ignoring invalid _port_crumb symbol");
+		diag_va[4] = 0;
+	}
 	diag_va[5] = macho_sym(&img, "_strlen");
-	xnu_dbg = (const unsigned long *)macho_sym(&img, "_linux64_dbg");
-	xnu_el0_stat = (const unsigned long *)macho_sym(&img, "_linux64_el0_stat");
+	if (diag_va[5] && ((diag_va[5] & 3) || !va_in_loaded_segs_prot(&img, diag_va[5], 4, 5))) {
+		logs("xnu: ignoring invalid _strlen symbol");
+		diag_va[5] = 0;
+	}
+	{
+		u64_t a_dbg = macho_sym(&img, "_linux64_dbg");
+		if (a_dbg && ((a_dbg & 7) || !va_in_loaded_segs_prot(&img, a_dbg, 16 * sizeof(unsigned long), 1))) {
+			logs("xnu: ignoring invalid _linux64_dbg symbol");
+			a_dbg = 0;
+		}
+		xnu_dbg = (const unsigned long *)a_dbg;
+
+		u64_t a_stat = macho_sym(&img, "_linux64_el0_stat");
+		if (a_stat && ((a_stat & 7) ||
+		    !va_in_loaded_segs_prot(&img, a_stat,
+					    (u64_t)LINUX64_CPU_SLOTS * 2 * LINUX64_EL0_CLASSES * sizeof(unsigned long), 1))) {
+			logs("xnu: ignoring invalid _linux64_el0_stat symbol");
+			a_stat = 0;
+		}
+		xnu_el0_stat = (const unsigned long *)a_stat;
+	}
 	{	/* the helpers run where XNU does not: a CPU running XNU lets Linux in only at XNU's calls into the host */
 		int host_cpu = cpus < fki_num_cpus() ? cpus : fki_num_cpus() - 1;
 		if (monitor_cpu == -2)
@@ -1218,11 +2159,24 @@ static int enter_arm_init(struct boot_args_v2 *ba)
 		if (fb_off && fb_dump && fb_dump_ms > 0 && img.region.va)
 			fb_thread = fki_thread_start(fb_fn, 0, monitor_cpu >= 0 ? monitor_cpu : host_cpu, "xnu-fb");
 	}
-	xnu_kfault = (void *)macho_sym(&img, "_linux64_kernel_fault");
-	xnu_kfault_recover = (void *)macho_sym(&img, "_linux64_kernel_fault_recover");
-	if (xnu_kfault && fki_fault_register(0xffffffe000000000ULL, 0xfffffffc00000000ULL, xnu_fault) == 0)
-		logs("xnu: kernel faults on XNU addresses go to XNU's vm_fault");
 	{
+		u64_t a_kf = macho_sym(&img, "_linux64_kernel_fault");
+		if (a_kf && ((a_kf & 3) || !va_in_loaded_segs_prot(&img, a_kf, 4, 5))) {
+			logs("xnu: ignoring invalid _linux64_kernel_fault symbol");
+			a_kf = 0;
+		}
+		xnu_kfault = (void *)a_kf;
+
+		u64_t a_kfr = macho_sym(&img, "_linux64_kernel_fault_recover");
+		if (a_kfr && ((a_kfr & 3) || !va_in_loaded_segs_prot(&img, a_kfr, 4, 5))) {
+			logs("xnu: ignoring invalid _linux64_kernel_fault_recover symbol");
+			a_kfr = 0;
+		}
+		xnu_kfault_recover = (void *)a_kfr;
+	}
+	if (!el0_mode && xnu_kfault && fki_fault_register(0xffffffe000000000ULL, 0xfffffffc00000000ULL, xnu_fault) == 0)
+		logs("xnu: kernel faults on XNU addresses go to XNU's vm_fault");
+	if (!el0_mode) {
 		/*
 		 * XNU's user half starts as Linux's TTBR0. Its TCR stays Linux's (T0SZ 16, 4-level): a 4K XNU user pmap's
 		 * hardware root (hw_ttep) is an L0 table whose first entry points at its L1 (ttep), as the walk showed.
@@ -1240,6 +2194,11 @@ static int enter_arm_init(struct boot_args_v2 *ba)
 		xnu_W.xnu_ttbr0 = ttbr0;
 	}
 	a_cpu_entry = macho_sym(&img, "_linux64_cpu_entry");
+	if (a_cpu_entry && ((a_cpu_entry & 3) || !va_in_loaded_segs_prot(&img, a_cpu_entry, 4, 5))) {
+		logs("xnu: ignoring invalid _linux64_cpu_entry symbol: one CPU");
+		a_cpu_entry = 0;
+		cpus = 1;
+	}
 	for (int c = 1; c < cpus; c++) {	/* the secondary CPUs' save areas start as the boot CPU's: XNU's keys, user TTBR0/TCR */
 		worlds[c].xnu_keys = xnu_W.xnu_keys;
 		worlds[c].xnu_tcr = xnu_W.xnu_tcr;
@@ -1252,8 +2211,9 @@ static int enter_arm_init(struct boot_args_v2 *ba)
 		if (!cpu_thread[c]) { logkv("xnu: cannot make a thread for CPU, running with CPUs below it:", (u64_t)c); cpus = c; }
 	}
 	logs("xnu: entering arm_init");
+	stop_state = STOP_ACTIVE_ONE;
 	in_xnu = 1;
-	long r = xnu_world_call(a_init, (unsigned long)ba);
+	long r = el0_mode ? xnu_world_call_el0(a_init, (unsigned long)ba) : xnu_world_call(a_init, (unsigned long)ba);
 	in_xnu = 0;
 	stop_run = 1;		/* the other CPUs end at their next call into the host (kicked out of idle) */
 	stop_commit();
@@ -1263,7 +2223,8 @@ static int enter_arm_init(struct boot_args_v2 *ba)
 		fki_thread_stop(cpu_thread[c]);
 		cpu_thread[c] = 0;
 	}
-	fki_fault_unregister();
+	if (!el0_mode)
+		fki_fault_unregister();
 	logkv("xnu: kernel faults forwarded to XNU", kfaults);
 	fki_thread_stop(monitor);
 	monitor = 0;
@@ -1334,11 +2295,102 @@ static int run_m2b(void)
 	logs("xnu: bootstrap window mapped");
 
 	unsigned char *base = (unsigned char *)XNU_WINDOW_BASE;
-	macho_copy(&img, base + image_off);
+	err = macho_copy(&img, base + image_off);
+	if (err) { logkv("xnu: macho_copy failed, err", (u64_t)err); return err; }
 	img.slide = 0;
 	struct boot_args_v2 *ba = build_boot(base, img.region.pa, img.region.size, image_off, image_size);
 	if (!ba) return -22;
 	return enter_arm_init(ba);
+}
+
+/* Pure EL0 host M2b: host manages the high window via fki_kmem_alloc; no contiguous multi-GB RAM needed. */
+static int run_m2b_el0(void)
+{
+	u64_t image_size = img.vmhigh - img.vmlow;
+	if (img.vmlow < 0xffffffe000000000ULL) { logs("xnu: unexpected link address"); return -22; }
+	if (ram_mb <= 0 || ram_mb > 65536) { logs("xnu: invalid ram_mb"); return -22; }
+	u64_t image_off = img.vmlow - XNU_WINDOW_BASE;
+	u64_t ram_bytes = (u64_t)ram_mb << 20;
+	u64_t overhead = image_off + image_size + 0x60000 + BOOT_EXTRA;
+	if (overhead < image_off || ram_bytes > (~0ULL) - overhead) { logs("xnu: ram_mb overflow"); return -22; }
+	u64_t want = overhead + ram_bytes;
+	/*
+	 * All of DRAM goes below the kernel (LINUX64_EL0_APERTURE_VA: XNU's physical aperture, the host's permanent
+	 * linear mapping in 2 MiB frames), so that it takes none of the room after the kernel's link address, which
+	 * the kernel map's ranges need whole: at the kernel's base it left them too little above about 8 GiB. The
+	 * image and the boot data are mapped a second time at the kernel's base, where they are linked to run
+	 * (fki_kmem_alias: the same frames, 2 MiB ones where the aperture has them, and as permanent).
+	 */
+	if (XNU_WINDOW_BASE < LINUX64_EL0_APERTURE_END || want > LINUX64_EL0_APERTURE_END - LINUX64_EL0_APERTURE_VA - 0x200000) {
+		logs("xnu: ram_mb does not fit below the kernel (or an unexpected link address)"); return -22;
+	}
+	int err = fki_kmem_alloc((unsigned long)want, (unsigned long)LINUX64_EL0_APERTURE_VA, XNU_FAKE_PHYS, &img.region);
+	if (err) { logkv("xnu: EL0 kmem allocation failed, err", (u64_t)err); return err; }
+	logkv("xnu: EL0 aperture base", (u64_t)img.region.va);
+	logkv("xnu: EL0 aperture size", img.region.size);
+	logkv("xnu: EL0 synthetic phys base", img.region.pa);
+
+	unsigned char *base = (unsigned char *)XNU_WINDOW_BASE;
+	u64_t head = (overhead + 0x1fffff) & ~0x1fffffULL;	/* at least what build_boot fills; cut to topOfKernelData below */
+	err = fki_kmem_alias(&img.region, (unsigned long)XNU_WINDOW_BASE, (unsigned long)head);
+	if (err) { logkv("xnu: EL0 mapping at the kernel's base failed, err", (u64_t)err); return err; }
+	err = macho_copy(&img, base + image_off);
+	if (err) { logkv("xnu: macho_copy failed, err", (u64_t)err); return err; }
+	img.slide = 0;
+	struct boot_args_v2 *ba = build_boot(base, img.region.pa, img.region.size, image_off, image_size);
+	if (!ba) return -22;
+	/* the kernel's static range ends at topOfKernelData rounded up to 2 MiB (arm_vm_init); its heap starts there */
+	u64_t top = (ba->topOfKernelData - img.region.pa + 0x1fffff) & ~0x1fffffULL;
+	if (top > head) { logs("xnu: boot data beyond the mapping at the kernel's base"); return -22; }
+	if (top < head) {	/* what follows is the kernel map's */
+		err = fki_kmem_alias(&img.region, (unsigned long)XNU_WINDOW_BASE, (unsigned long)top);
+		if (err) { logkv("xnu: EL0 mapping at the kernel's base could not be cut, err", (u64_t)err); return err; }
+	}
+	logkv("xnu: EL0 kernel static range base", XNU_WINDOW_BASE);
+	logkv("xnu: EL0 kernel static range end", XNU_WINDOW_BASE + top);
+	return enter_arm_init(ba);
+}
+
+static void xnu_cleanup(void)
+{
+	for (int i = 0; i < LINUX64_CPU_SLOTS; i++) {
+		if (cpu_hot[i].utcb) {
+			fki_utcb_destroy(cpu_hot[i].utcb);
+			cpu_hot[i].utcb = 0;
+			cpu_hot[i].utcb_thread = 0;
+			cpu_hot[i].utcb_fpu_live = 0;
+			cpu_hot[i].utcb_disable_jop = -1;
+		}
+	}
+	if (window_l1) {
+		int last = -1;
+		for (int i = 0; i < 512; i++) if (window_owned[i]) { window_l1[i] = 0; window_owned[i] = 0; last = i; }
+		if (last >= 0) fki_window_set(&window_l1[last], 0);
+		window_l1 = 0;
+		window_slot = 0;
+	}
+	if (mode == 3) {
+		if (el0_mode) {
+			if (img.region.va) fki_kmem_free(&img.region);
+		} else {
+			if (img.region.va) fki_contig_free(&img.region);
+			if (l2page.va) fki_contig_free(&l2page);
+		}
+	} else if (img.region.va) {
+		fki_region_free(&img.region);
+	}
+	img.region.va = 0;
+	img.region.handle = 0;
+	l2page.va = 0;
+	l2page.handle = 0;
+	if (blob) { fki_blob_put(blob); blob = 0; }
+	if (rd_blob) { fki_blob_put(rd_blob); rd_blob = 0; }
+	if (tc_blob) { fki_blob_put(tc_blob); tc_blob = 0; }
+	if (hd_file) { fki_file_close(hd_file); hd_file = 0; }
+	if (ks_file) { fki_file_close(ks_file); ks_file = 0; }
+	if (dk_file) { fki_file_close(dk_file); dk_file = 0; }
+	if (ci_file) { fki_file_close(ci_file); ci_file = 0; }
+	if (in_file) { fki_file_close(in_file); in_file = 0; }
 }
 
 static int __init xnu_init(void)
@@ -1346,15 +2398,26 @@ static int __init xnu_init(void)
 	const void *data; unsigned long size;
 	int err;
 
-	if (fki_version() != 0)
+	if (fki_version() != FKI_VERSION)
 		return -22;
+	if (ram_mb <= 0 || ram_mb > 65536)
+		return -22;
+	el0_mode = !!(fki_caps() & FKI_CAP_EL0);
+	logkv("xnu: FKI caps", fki_caps());
+	if (el0_mode && !(fki_caps() & FKI_CAP_PAC)) {
+		logs("xnu: EL0 mode requires FKI_CAP_PAC");
+		return -95;
+	}
+	/* every random number XNU takes comes from Linux's generator (the boot seeds, LINUX64_CALL_RANDOM): seeded first */
+	err = fki_random_wait();
+	if (err) { logkv("xnu: Linux's random number generator is not seeded, err", (u64_t)err); return err; }
 	if (ramdisk) {
 		err = fki_blob_get(ramdisk, &rd_data, &rd_size, &rd_blob);
-		if (err) { logkv("xnu: cannot read the RAM disk, err", (u64_t)err); return err; }
+		if (err) { logkv("xnu: cannot read the RAM disk, err", (u64_t)err); goto fail; }
 	}
 	if (trustcache) {
 		err = fki_blob_get(trustcache, &tc_data, &tc_size, &tc_blob);
-		if (err) { logkv("xnu: cannot read the trust cache, err", (u64_t)err); return err; }
+		if (err) { logkv("xnu: cannot read the trust cache, err", (u64_t)err); goto fail; }
 	}
 	if (console_in) {
 		fki_u64 sz = 0;
@@ -1375,18 +2438,18 @@ static int __init xnu_init(void)
 	}
 	if (disk) {
 		dk_file = fki_file_open(disk, 1, &dk_size);
-		if (!dk_file) { logs("xnu: cannot open the block disk"); return -2; }
+		if (!dk_file) { logs("xnu: cannot open the block disk"); err = -2; goto fail; }
 		logkv("xnu: block disk bytes", dk_size);
 	}
 	if (hostdisk) {
 		hd_file = fki_file_open(hostdisk, hostdisk_rw, &hd_size);
-		if (!hd_file) { logs("xnu: cannot open the host disk"); return -2; }
+		if (!hd_file) { logs("xnu: cannot open the host disk"); err = -2; goto fail; }
 		logkv("xnu: host disk bytes", hd_size);
 	}
 	err = fki_blob_get(image, &data, &size, &blob);
-	if (err) { logkv("xnu: cannot read image, err", (u64_t)err); return err; }
+	if (err) { logkv("xnu: cannot read image, err", (u64_t)err); goto fail; }
 	err = macho_load(&img, data, size, mode == 3 ? ~0UL : mode == 2 ? (unsigned long)ram_mb << 20 : 0);
-	if (err) { logkv("xnu: load failed", (u64_t)err); fki_blob_put(blob); blob = 0; return err; }
+	if (err) { logkv("xnu: load failed", (u64_t)err); goto fail; }
 	logkv("xnu: image vmlow", img.vmlow);
 	logkv("xnu: image size", img.vmhigh - img.vmlow);
 	if (mode != 3) {
@@ -1396,29 +2459,22 @@ static int __init xnu_init(void)
 
 	fki_random(&xnu_W.xnu_keys, sizeof(xnu_W.xnu_keys));
 	xnu_W.xnu_keys.sctlr_en = ~0ULL;
+	fki_random(&xnu_user_keys, sizeof(xnu_user_keys));
+	xnu_user_keys.sctlr_en = ~0ULL;
 
-	return mode == 1 ? run_m1() : mode == 3 ? run_m2b() : run_m2a();
+	err = mode == 1 ? run_m1() : mode == 3 ? (el0_mode ? run_m2b_el0() : run_m2b()) : run_m2a();
+	if (err)
+		goto fail;
+	return 0;
+
+fail:
+	xnu_cleanup();
+	return err;
 }
 
 static void __exit xnu_exit(void)
 {
-	if (window_l1) {
-		int last = -1;
-		for (int i = 0; i < 512; i++) if (window_owned[i]) { window_l1[i] = 0; last = i; }
-		if (last >= 0) fki_window_set(&window_l1[last], 0);
-	}
-	if (mode == 3) {
-		if (img.region.va) fki_contig_free(&img.region);
-		if (l2page.va) fki_contig_free(&l2page);
-	} else if (img.region.va) fki_region_free(&img.region);
-	if (blob) fki_blob_put(blob);
-	if (rd_blob) fki_blob_put(rd_blob);
-	if (tc_blob) fki_blob_put(tc_blob);
-	if (hd_file) fki_file_close(hd_file);
-	if (ks_file) fki_file_close(ks_file);
-	if (dk_file) fki_file_close(dk_file);
-	if (ci_file) fki_file_close(ci_file);
-	if (in_file) fki_file_close(in_file);
+	xnu_cleanup();
 }
 
 module_init(xnu_init);

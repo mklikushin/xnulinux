@@ -30,15 +30,24 @@ extern "C" {
 #endif
 
 /*
- * xnu.ko's entry point (0: not hosted) and the slide it applied. TPIDR_EL1 is Linux's per-CPU base: XNU's kernel keeps
- * its thread pointer in TPIDRRO_EL0 (per CPU), and user space gets its TSD there on each return to EL0.
+ * xnu.ko's entry point (0: not hosted), EL0-host flag (1: hosted kernel runs at EL0) and the slide it applied.
+ * TPIDR_EL1 is Linux's per-CPU base (or inaccessible at EL0): XNU's kernel keeps its thread pointer in TPIDR_EL0
+ * (per CPU), and user space gets its own TLS registers on each return to EL0.
  */
 extern unsigned long linux64_hook;
 extern unsigned long linux64_slide;
-/* This CPU's slot in the per-CPU arrays (LINUX64_CPU_SLOT of its MPIDR): valid before XNU knows its cpu number */
+extern unsigned int linux64_el0;
+extern unsigned int linux64_el0_caps;
+/* This CPU's slot in the per-CPU arrays: valid before XNU knows its cpu number */
 static inline unsigned
 linux64_cpu_slot(void)
 {
+	if (linux64_el0) {
+		unsigned long id;
+
+		__asm__ volatile ("mrs %0, TPIDRRO_EL0" : "=r"(id));
+		return (unsigned)(id & (LINUX64_CPU_SLOTS - 1));
+	}
 	unsigned long mpidr;
 
 	__asm__ volatile ("mrs %0, MPIDR_EL1" : "=r"(mpidr));
@@ -118,6 +127,10 @@ void linux64_trust_cache_late_init(void);
 int linux64_amfi_off(void);
 /* osfmk/arm64/cswitch.s, sleh.c: user space while hosted */
 void linux64_el0_run(void *saved_state, unsigned long arg) __attribute__((noreturn));
+struct thread;
+void linux64_el0_fpu_switch_out(struct thread *old);
+void linux64_el0_fpu_flush(struct thread *thread);
+void linux64_el0_fpu_invalidate(struct thread *thread);
 /* osfmk/arm/machine_routines_common.c: in a spin-wait, let the host take this CPU now and then (see arm/locks.h) */
 void linux64_spin_relax(void);
 /* osfmk/kern/sched_prim.c: every thread's state and saved frames to the host log (on the host's request) */

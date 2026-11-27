@@ -9,7 +9,8 @@
  * a call with no service to answer it fails at once (-ENODEV), not after HC_TIMEOUT: the other CPUs would time out
  * waiting on that one (an XNU panic). The service also asks fki to translate its own mappings into physical addresses
  * (XNU_HOSTCALL_XLATE), so the foreign kernel can map the same pages. Pages nothing else holds in place (shared memory,
- * not a driver's buffer) it pins first (XNU_HOSTCALL_PIN), until XNU_HOSTCALL_UNPIN or its close.
+ * not a driver's buffer) it pins first (XNU_HOSTCALL_PIN), until XNU_HOSTCALL_UNPIN or its close; a device mapping
+ * (VM_IO, VM_PFNMAP) has no pages to pin and is refused with -EOPNOTSUPP.
  */
 #include "fki.h"
 #include "fki_internal.h"
@@ -224,9 +225,32 @@ static long hc_xlate(struct xnu_hostcall_xlate __user *ua)
 
 static void hc_pin_free(struct hc_pin *p)
 {
-	unpin_user_pages(p->pages, p->n);
+	unpin_user_pages_dirty_lock(p->pages, p->n, true);	/* the foreign kernel wrote them through its own mappings */
 	kvfree(p->pages);
 	kfree(p);
+}
+
+/* 1 when any part of the range is a device mapping or not mapped at all (the pin then fails by itself) */
+static int hc_range_is_device(unsigned long va, unsigned long len)
+{
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *vma;
+	unsigned long at = va;
+	int dev = 0;
+
+	mmap_read_lock(mm);
+	while (at < va + len) {
+		vma = vma_lookup(mm, at);
+		if (!vma)
+			break;
+		if (vma->vm_flags & (VM_IO | VM_PFNMAP)) {
+			dev = 1;
+			break;
+		}
+		at = vma->vm_end;
+	}
+	mmap_read_unlock(mm);
+	return dev;
 }
 
 static long hc_pin(struct hc_file *hf, unsigned int cmd, struct xnu_hostcall_range __user *ua)
@@ -253,6 +277,10 @@ static long hc_pin(struct hc_file *hf, unsigned int cmd, struct xnu_hostcall_ran
 	}
 	if (((a.va | a.len) & (PAGE_SIZE - 1)) || !a.len || (a.len >> PAGE_SHIFT) > HC_PIN_MAX)
 		return -EINVAL;
+	if (a.va + a.len < a.va)
+		return -EINVAL;
+	if (hc_range_is_device(a.va, a.len))
+		return -EOPNOTSUPP;
 	p = kzalloc(sizeof(*p), GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
