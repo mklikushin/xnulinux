@@ -1,17 +1,28 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
-# In the hosted macOS, as the user who is logged in on its screen: give the display the system's sRGB colour profile.
+# In the hosted macOS, as the logged-in user: bind the hosted display (IOMFBUUID 44726F69-6456-4D00-0000-000000000001)
+# to the system's sRGB profile via defaults (no clang / Command Line Tools required). Takes effect on next login/restart.
 #
-#   sh display-srgb.sh [srgb|reset]      (needs clang: Apple's Command Line Tools, tools/hosted/install-developer-tools.sh)
+#   sh display-srgb.sh [srgb|reset]
 #
-# The hosted display describes itself by its primaries and a 2.2 gamma, and macOS builds a profile of its own from that
-# ("xnulinux Display"). Everything drawn in sRGB (nearly all of it) is then converted on its way to the screen, per
-# pixel, by the window server, on the CPU. With the sRGB profile the conversion is not needed: with a page animating in
-# a full-size Chrome window the window server took 1.7 CPUs instead of 3.3 (switched back and forth within one boot),
-# and a transparent, blurred-backdrop browser window drew 12.0 frames a second instead of 11.5. The setting is the
-# user's (ColorSync, as System Settings > Displays > Colour profile sets it) and stays across restarts. The display
-# driver's DefaultColorSpaceIsSRGB attribute did not do this: the profile and the draws were the same with it.
+# macOS synthesizes a custom ICC profile ("xnulinux Display-<UUID>.icc") for AppleParavirtDisplay that fails
+# CGColorSpaceEqualToColorSpace(..., kCGColorSpaceSRGB), forcing WindowServer to run a per-pixel color-conversion shader
+# on sRGB surfaces on the CPU. Binding sRGB Profile.icc halves Chrome's WindowServer CPU (~332% -> ~175% at 60 fps) and
+# nudges a transparent/blurred browser window from ~11.5 to ~12.0 fps.
 set -e
-d=$(dirname "$0"); t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
-clang -fobjc-arc -framework Cocoa -framework ColorSync -o "$t/display-srgb" "$d/display-srgb.m"
-"$t/display-srgb" "${1:-srgb}"
+DEV="Device.mntr.44726F69-6456-4D00-0000-000000000001"
+case "${1:-srgb}" in
+  srgb)
+    defaults -currentHost write -g com.apple.ColorSync.Devices -dict-add "$DEV" \
+      '<dict><key>CustomProfiles</key><dict><key>1</key><string>/System/Library/ColorSync/Profiles/sRGB Profile.icc</string></dict></dict>'
+    echo "set sRGB profile for $DEV (takes effect on next login/restart)"
+    ;;
+  reset)
+    defaults -currentHost delete -g com.apple.ColorSync.Devices 2>/dev/null || true
+    echo "cleared custom ColorSync device profiles (takes effect on next login/restart)"
+    ;;
+  *)
+    echo "usage: $0 [srgb|reset]" >&2
+    exit 2
+    ;;
+esac

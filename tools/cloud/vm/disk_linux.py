@@ -313,8 +313,9 @@ def cmd_stage(args):
             root_write(path, plistlib.dumps(user_disabled))
         else:
             sudo('rm', '-f', path)
-        # 5. the rest of the tuning: no Spotlight indexing, no Power Nap, less for the compositor to blend and animate
+        # 5. the rest of the tuning: no Spotlight indexing, no Power Nap, sRGB display profile, less for the compositor to blend and animate
         job = D / 'Library/LaunchDaemons/xnulinux.tune.plist'
+        srgb_agent = D / 'Library/LaunchAgents/xnulinux.display-srgb.plist'
         prefs = [(D / 'Library/Preferences/com.apple.universalaccess.plist', {'reduceTransparency': True, 'reduceMotion': True}, '644', '0:0'),
                  (D / 'Library/Preferences/com.apple.Accessibility.plist', {'ReduceMotionEnabled': True}, '644', '0:0'),
                  (home / 'Library/Preferences/com.apple.universalaccess.plist', {'reduceTransparency': True, 'reduceMotion': True}, '600', '501:20'),
@@ -322,8 +323,12 @@ def cmd_stage(args):
         if tune:
             root_write(job, plistlib.dumps({'Label': 'xnulinux.tune', 'RunAtLoad': True, 'ProgramArguments': [
                 '/bin/sh', '-c', '/usr/bin/mdutil -a -i off; /usr/bin/pmset -a powernap 0']}))
+            root_write(srgb_agent, plistlib.dumps({'Label': 'xnulinux.display-srgb', 'RunAtLoad': True, 'ProgramArguments': [
+                '/usr/bin/defaults', '-currentHost', 'write', '-g', 'com.apple.ColorSync.Devices', '-dict-add',
+                'Device.mntr.44726F69-6456-4D00-0000-000000000001',
+                '<dict><key>CustomProfiles</key><dict><key>1</key><string>/System/Library/ColorSync/Profiles/sRGB Profile.icc</string></dict></dict>']}))
         else:
-            sudo('rm', '-f', job)
+            sudo('rm', '-f', job, srgb_agent)
         for path, keys, mode, owner in prefs:
             old = root_read(path)
             value = plistlib.loads(old) if old else {}
