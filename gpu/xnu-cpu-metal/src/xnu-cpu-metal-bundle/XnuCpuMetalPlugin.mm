@@ -375,7 +375,6 @@ static BOOL xcmRangeIsFullyWritable(void *ptr, size_t len) {
     BOOL _iosurfaceIsYCbCrBacking;
     BOOL _displayFenced;
     uint64_t _displayFenceChecked;
-    int _displayWritesPending;
     XcmBuffer *_buffer;
     NSUInteger _bufferOffset;
     NSUInteger _bufferBytesPerRow;
@@ -674,16 +673,23 @@ static bool xcmIOSurfacePlaneLayout(IOSurfaceRef surf, NSUInteger plane, NSUInte
     }
     return _displayFenced;
 }
+// The count is the surface's, not this object's: two textures of one surface can each have a frame in flight, and the
+// surface is pending until the last of them is written back.
+static std::mutex gDisplayPendingLock;
+static std::unordered_map<uint32_t, int> gDisplayPending;   // by surface id; absent: none
 - (void)displayWritePending {
-    @synchronized(self) {
-        if (_iosurface && _displayWritesPending++ == 0) IOSurfaceSetValue(_iosurface, CFSTR("XnuDisplayPending"), kCFBooleanTrue);
-    }
+    if (!_iosurface) return;
+    std::lock_guard<std::mutex> lk(gDisplayPendingLock);
+    if (gDisplayPending[IOSurfaceGetID(_iosurface)]++ == 0) IOSurfaceSetValue(_iosurface, CFSTR("XnuDisplayPending"), kCFBooleanTrue);
 }
 - (void)displayWriteDone {
-    @synchronized(self) {
-        if (_iosurface && _displayWritesPending > 0 && --_displayWritesPending == 0)
-            IOSurfaceSetValue(_iosurface, CFSTR("XnuDisplayPending"), kCFBooleanFalse);
-    }
+    if (!_iosurface) return;
+    std::lock_guard<std::mutex> lk(gDisplayPendingLock);
+    auto it = gDisplayPending.find(IOSurfaceGetID(_iosurface));
+    if (it == gDisplayPending.end()) return;
+    if (--it->second > 0) return;
+    gDisplayPending.erase(it);
+    IOSurfaceSetValue(_iosurface, CFSTR("XnuDisplayPending"), kCFBooleanFalse);
 }
 - (id<MTLDevice>)device { return _device; }
 - (MTLTextureType)textureType { return _textureType; }

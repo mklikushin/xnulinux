@@ -319,7 +319,6 @@ private:
     // where the display waits by itself: on the surfaces that carry "XnuDisplayFence" (set here on each surface swapped;
     // boot-arg xnudisplay-fence=0: not set, the device waits as before) it sets "XnuDisplayPending" when the frame is
     // committed and clears it after the write, and the copy thread shows a surface once it is clear.
-    uint32_t fFenced[8];              // the ids of the surfaces that carry the value, the latest first
     uint32_t fSeedFence;
     uint64_t fSeedWaits, fSeedWaitNs, fSeedWaitMaxNs, fSeedLate;
     bool framePending(IOSurface *);
@@ -928,29 +927,18 @@ bool XnuDisplay::framePending(IOSurface *surface)
     return pending;
 }
 
-// Wait until the frame of a swap is in its surface (fFenced). False: a newer swap came first, this one is not shown.
+// Wait until the frame of a swap is in its surface. False: a newer swap came first, this one is not shown.
 bool XnuDisplay::awaitFrame(IOSurface *surface)
 {
-    const uint32_t id = ioSurfaceID(surface);
-    unsigned at = 0;
-    while (at < 8 && fFenced[at] != id)
-        at++;
-    // The surface itself says whether it carries the value: a surface of a new WindowServer can come with the id of one
-    // that is gone.
-    {
+    // The surface itself says whether it carries the value, at every swap: a surface of a new WindowServer can come with
+    // the id of one that is gone.
+    if (fSeedFence) {
         uint32_t unused = 0;
-        if (fSeedFence) {
-            OSObject *value = ioSurfaceCopyValue(surface, "XnuDisplayFence", &unused);
-            if (value != kOSBooleanTrue)
-                ioSurfaceSetValue(surface, "XnuDisplayFence", kOSBooleanTrue, &unused);
-            OSSafeReleaseNULL(value);
-        }
-        if (at == 8)
-            at = 7;
+        OSObject *value = ioSurfaceCopyValue(surface, "XnuDisplayFence", &unused);
+        if (value != kOSBooleanTrue)
+            ioSurfaceSetValue(surface, "XnuDisplayFence", kOSBooleanTrue, &unused);
+        OSSafeReleaseNULL(value);
     }
-    for (; at > 0; at--)
-        fFenced[at] = fFenced[at - 1];
-    fFenced[0] = id;
     if (!framePending(surface))
         return true;
     const uint64_t begin = mach_absolute_time();
