@@ -1,0 +1,223 @@
+From: xnulinux
+Subject: [PATCH] linux64: cheaper system calls and wakeups while hosted
+
+Measured on a Cortex-X925 (DGX Spark) with the CPU's statistical profiling (SPE), which samples XNU's kernel although
+Linux's interrupts are masked there: a read of the counter costs 13 ns and an ISB 7 ns, and a system call that does
+nothing (getppid, 300 ns) read the counter about ten times; a byte through a pipe to another process and back took
+8 us, most of it in Linux's scheduler and in world switches.
+
+- ml_set_interrupts_enabled: where interrupts come back on, look at the host's interrupt line (ISR_EL1), not at the
+  clock. A pending host interrupt (its tick at the latest) is what the check every 2 ms stood in for.
+- EL0 exceptions: the per-class times only with linux64_el0_time=1 (or linux64_trace); the per-class counts stay.
+- Idle: the CPU polls its pending word for a while before it goes to the host (as KVM's halt polling does), and a CPU
+  that signals a polling one makes no call into the host. The window adapts, up to linux64_idle_poll_us (200; 0: off).
+---
+diff --git a/osfmk/arm/machine_routines_common.c b/osfmk/arm/machine_routines_common.c
+index 2d18613..f1c78a5 100644
+--- a/osfmk/arm/machine_routines_common.c
++++ b/osfmk/arm/machine_routines_common.c
+@@ -1108,17 +1108,18 @@ ml_set_interrupts_enabled_with_debug(boolean_t enable, boolean_t __unused debug)
+ 				/*
+ 				 * Kernel code that runs long without going to user space or idle never sees a host interrupt
+ 				 * (hardware IRQs stay masked in XNU's kernel), which stalls Linux (RCU) and stops XNU's own
+-				 * clock. Where XNU would take a pending interrupt, re-enabling interrupts, let Linux run its
+-				 * interrupts every 2 ms and deliver XNU's timer if it is due, as the IRQ path does; and take an
+-				 * IPI another CPU sent.
++				 * clock. Where XNU would take a pending interrupt, re-enabling interrupts: if the host has one
++				 * pending (ISR_EL1; its tick at the latest), let Linux take it and deliver XNU's timer if it is
++				 * due, as the IRQ path does; and take an IPI another CPU sent. Nothing pending is the common
++				 * case and costs one register read: reading the counter here instead (13 ns on a Cortex-X925,
++				 * and an ISB before it) was a third of a system call.
++				 * XNU's timer is delivered here at the host's next interrupt on this CPU, its tick at the latest: late by
++				 * up to a tick (4 ms with HZ=250, and a CPU the host has stopped the tick on has none) where the bound was 2 ms.
+ 				 */
+-				static uint64_t linux64_last_kyield[LINUX64_CPU_SLOTS];
+-				uint64_t now = mach_absolute_time();
+ 				cpu_data_t *cdp = thread->machine.CpuDatap;
+ 				if (cdp->cpu_int_state == NULL) {
+-					if (now - linux64_last_kyield[slot] > 48000) {
++					if (__improbable(__builtin_arm_rsr64("ISR_EL1") & 0xc0)) {	/* IRQ or FIQ pending */
+ 						extern void rtclock_intr(unsigned int);
+-						linux64_last_kyield[slot] = now;
+ 						/*
+ 						 * Not with preemption off (a spinlock held): Linux may reschedule this CPU's thread
+ 						 * away for as long as it likes, and every other CPU spins on the lock until XNU's
+@@ -1458,6 +1459,9 @@ linux64_spin_relax(void)
+ 	}
+ }
+ 
++/* A CPU that is idle and still polling its pending word before it asks the host to sleep (osfmk/arm64/cpu.c) */
++unsigned int linux64_idle_polling[LINUX64_CPU_SLOTS];
++
+ void
+ linux64_ipi_take(void)
+ {
+@@ -1478,7 +1482,11 @@ linux64_cpu_signal(unsigned int cpu)
+ 		return;
+ 	}
+ 	mpidr = target->cpu_phys_id;
+-	os_atomic_store(&linux64_ipi_pending[LINUX64_CPU_SLOT(mpidr)], 1, release);
++	os_atomic_store(&linux64_ipi_pending[LINUX64_CPU_SLOT(mpidr)], 1, seq_cst);
++	os_atomic_thread_fence(seq_cst);	/* the pending word before the target's polling flag: pairs with linux64_cpu_idle */
++	if (os_atomic_load(&linux64_idle_polling[LINUX64_CPU_SLOT(mpidr)], seq_cst)) {
++		return;		/* idle and watching its pending word (linux64_cpu_idle): no call into the host, no wakeup there */
++	}
+ 	linux64_call2(LINUX64_CALL_IPI, mpidr, 0);
+ }
+ 
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index 91f6577..0867654 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -505,32 +505,90 @@ wfe_to_deadline_or_interrupt(uint32_t cid, uint64_t wfe_deadline, cpu_data_t *cd
+ }
+ 
+ /*
+- * LINUX64 (xnulinux): hosted, idle goes straight to the host, which runs Linux until XNU's next timer deadline and
+- * comes back; the due timer is then delivered here as its interrupt would be. No WFE/WFI and no timer interrupt of
+- * XNU's own apply (idle_enable stays FALSE without the CPU kext: cpu_machine_init never runs).
++ * LINUX64 (xnulinux): hosted, idle goes to the host, which runs Linux until XNU's next timer deadline and comes back;
++ * the due timer is then delivered here as its interrupt would be. No WFE/WFI and no timer interrupt of XNU's own apply
++ * (idle_enable stays FALSE without the CPU kext: cpu_machine_init never runs).
++ *
++ * Going to the host and coming back is two world switches (each drops this CPU's TLB) and a pass through Linux's
++ * scheduler, and the CPU that makes a thread runnable here pays a world switch of its own to have Linux wake this one:
++ * a message to another process and its answer cost several microseconds that way. So, as KVM does before it blocks a
++ * virtual CPU (halt polling), this CPU first watches its pending word for a while, and one that signals it meanwhile
++ * (linux64_cpu_signal) makes no call into the host at all. The window follows what happens: it opens and doubles (to
++ * linux64_idle_poll_us, 200 by default; 0 turns polling off) when the host's sleep is ended early by another CPU, and
++ * halves, down to nothing, when a sleep outlasts it; a CPU that is idle for long does not poll.
+  */
++extern unsigned int linux64_idle_polling[LINUX64_CPU_SLOTS];
++static uint64_t linux64_idle_poll[LINUX64_CPU_SLOTS];	/* each CPU's window, in timebase ticks */
++
++static uint64_t
++linux64_idle_poll_max(void)
++{
++	static uint64_t max = ~0ULL;
++
++	if (__improbable(max == ~0ULL)) {
++		uint32_t us = 200;
++		uint64_t t;
++		(void)PE_parse_boot_argn("linux64_idle_poll_us", &us, sizeof(us));
++		nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &t);
++		max = t;
++	}
++	return max;
++}
++
+ static void
+ linux64_cpu_idle(cpu_data_t *cpu_data_ptr)
+ {
++	unsigned int slot = linux64_cpu_slot();
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t deadline = cpu_data_ptr->rtcPop;
+-	uint64_t ns = 0;	/* a timer already due: no sleep, only let Linux take its interrupts */
++	uint64_t max = linux64_idle_poll_max(), window = linux64_idle_poll[slot];
++	bool timer = deadline != 0 && deadline != EndOfAllTime;
++	bool signaled = false;
+ 
+ 	linux64_count(LINUX64_CTR_CPU_IDLE);
+-	if (deadline == 0 || deadline == EndOfAllTime) {
+-		ns = NSEC_PER_MSEC;	/* no timer armed: check the run queue again in 1 ms */
+-	} else if (deadline > now) {
+-		/* relative: XNU's timebase (mach_absolute_time) is offset from the host's counter */
+-		absolutetime_to_nanoseconds(deadline - now, &ns);
+-	}
+ 	if (linux64_dbg[LINUX64_CTR_DUMP_REQ] && os_atomic_xchg(&linux64_dbg[LINUX64_CTR_DUMP_REQ], 0, relaxed)) {
+ 		linux64_dump_threads();	/* the host asked: who is blocked, and where */
+ 	}
+-	linux64_count(LINUX64_CTR_HOST_IDLE);
+-	linux64_call2(LINUX64_CALL_IDLE, ns, (unsigned long)&linux64_ipi_pending[linux64_cpu_slot()]);
++	if (window != 0 && !(timer && deadline <= now)) {
++		uint64_t end = now + window;
++
++		if (timer && deadline < end) {
++			end = deadline;
++		}
++		os_atomic_store(&linux64_idle_polling[slot], 1, seq_cst);
++		/* until another CPU signals this one, the timer is due, or the host has an interrupt for Linux to take */
++		while (!os_atomic_load(&linux64_ipi_pending[slot], relaxed) && !(__builtin_arm_rsr64("ISR_EL1") & 0xc0) &&
++		    (now = mach_absolute_time()) < end) {
++			__builtin_arm_yield();
++		}
++		os_atomic_store(&linux64_idle_polling[slot], 0, seq_cst);
++		os_atomic_thread_fence(seq_cst);	/* the flag before the pending word: pairs with linux64_cpu_signal */
++		signaled = os_atomic_load(&linux64_ipi_pending[slot], seq_cst) != 0;
++	}
++	if (!signaled) {
++		uint64_t ns = 0;	/* a timer already due: no sleep, only let Linux take its interrupts */
++		uint64_t slept;
++
++		now = mach_absolute_time();
++		if (!timer) {
++			ns = NSEC_PER_MSEC;	/* no timer armed: check the run queue again in 1 ms */
++		} else if (deadline > now) {
++			/* relative: XNU's timebase (mach_absolute_time) is offset from the host's counter */
++			absolutetime_to_nanoseconds(deadline - now, &ns);
++		}
++		linux64_count(LINUX64_CTR_HOST_IDLE);
++		linux64_call2(LINUX64_CALL_IDLE, ns, (unsigned long)&linux64_ipi_pending[slot]);
++		slept = mach_absolute_time() - now;
++		if (slept >= max) {
++			window = window / 2 >= max / 16 ? window / 2 : 0;
++		} else if (ns != 0 && os_atomic_load(&linux64_ipi_pending[slot], relaxed)) {
++			window = window == 0 ? max / 8 : window * 2 < max ? window * 2 : max;
++		}
++		linux64_idle_poll[slot] = window;
++	}
+ 	cpu_data_ptr->cpu_decrementer = -1;
+ 	rtclock_intr(FALSE);
+-	linux64_ipi_take();		/* what woke the host's idle call early, if it was another CPU */
++	linux64_ipi_take();		/* what ended the wait early, if it was another CPU */
+ 	ClearIdlePop(TRUE);
+ 	cpu_idle_exit(FALSE);
+ }
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index bbc634a..77b8754 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -3745,6 +3745,21 @@ linux64_tracing(void)
+ 	return linux64_trace_level;
+ }
+ 
++/* boot-arg linux64_el0_time=1 (or linux64_trace), read once: time the EL0 exceptions by class */
++static int linux64_el0_timing_on = -1;
++static inline int
++linux64_el0_timing(void)
++{
++	if (__improbable(linux64_el0_timing_on < 0)) {
++		int v = 0;
++		if (!PE_parse_boot_argn("linux64_el0_time", &v, sizeof(v))) {
++			v = 0;
++		}
++		linux64_el0_timing_on = (v || linux64_tracing()) ? 1 : 0;
++	}
++	return linux64_el0_timing_on;
++}
++
+ static thread_t linux64_svc_thread;	/* linux64_trace: the thread whose system call is in flight, and its number */
+ static long long linux64_svc_num;
+ 
+@@ -3864,7 +3879,7 @@ linux64_thread_bootstrap_return(void)
+ #if PRECISE_USER_KERNEL_TIME
+ 	recount_enter_user();		/* user time vs system time, as locore's return to user space does */
+ #endif
+-	{	/* the host's per-class accounting (linux64_abi.h): the exception this CPU took last is now done */
++	if (__improbable(linux64_el0_timing())) {	/* the host's per-class accounting (linux64_abi.h): the exception this CPU took last is now done */
+ 		struct linux64_el0_pcpu *pcpu = &linux64_el0_pcpu[linux64_cpu_slot()];
+ 		if (pcpu->t0 != 0) {
+ 			unsigned int stat_slot = (unsigned int)cpu_number() & (LINUX64_EL0_CPUS - 1);
+@@ -3901,8 +3916,10 @@ linux64_el0_dispatch(const uint64_t x[31], uint64_t sp, uint64_t pc, uint64_t cp
+ 		unsigned int ec = (unsigned int)ESR_EC(esr);
+ 		unsigned int cls = esr == ~0ULL ? 3 : ec == ESR_EC_SVC_64 ? 0 : ec == ESR_EC_DABORT_EL0 ? 1 : ec == ESR_EC_IABORT_EL0 ? 2 : 4;
+ 		linux64_el0_stat[stat_slot][0][cls]++;
+-		pcpu->cls = (uint8_t)cls;
+-		pcpu->t0 = __builtin_arm_rsr64("CNTVCT_EL0");
++		if (__improbable(linux64_el0_timing())) {	/* how long each class takes: two reads of the counter (13 ns each on a Cortex-X925) for each exception; on request */
++			pcpu->cls = (uint8_t)cls;
++			pcpu->t0 = __builtin_arm_rsr64("CNTVCT_EL0");
++		}
+ 		pcpu->local_exc++;
+ 		if (cls != 0 || pcpu->local_exc >= 64) {
+ 			os_atomic_add(&linux64_dbg[LINUX64_CTR_EL0_EXC], pcpu->local_exc, relaxed);
