@@ -92,6 +92,9 @@ uint64_t ioSurfaceBytesPerRow(const IOSurface *) __asm("__ZNK9IOSurface14getByte
 uint64_t ioSurfaceBaseOffset(const IOSurface *) __asm("__ZNK9IOSurface13getBaseOffsetEv");
 uint32_t ioSurfacePixelFormat(const IOSurface *) __asm("__ZNK9IOSurface14getPixelFormatEv");
 uint32_t ioSurfaceUnlockSeed(const IOSurface *) __asm("__ZNK9IOSurface13getUnlockSeedEv");
+uint32_t ioSurfaceID(const IOSurface *) __asm("__ZNK9IOSurface12getSurfaceIDEv");
+OSObject *ioSurfaceCopyValue(const IOSurface *, const char *, uint32_t *) __asm("__ZNK9IOSurface9copyValueEPKcPj");
+int ioSurfaceSetValue(IOSurface *, const char *, const OSMetaClassBase *, uint32_t *) __asm("__ZN9IOSurface8setValueEPKcPK15OSMetaClassBasePj");
 IOMemoryDescriptor *ioSurfaceMemory(const IOSurface *) __asm("__ZNK9IOSurface19getMemoryDescriptorEv");
 uint32_t ioSurfacePlaneCount(const IOSurface *) __asm("__ZNK9IOSurface13getPlaneCountEv");
 uint64_t ioSurfacePlaneOffset(const IOSurface *, uint32_t) __asm("__ZNK9IOSurface14getPlaneOffsetEj");
@@ -232,6 +235,7 @@ private:
     ScanoutResource *scanoutResource(IOSurface *, uint32_t format);
     bool releaseResource(ScanoutResource &);
     void requestCopy(IOSurface *, bool refresh, uint64_t work = 0);
+    bool awaitFrame(IOSurface *);
     void copyLoop();
     static void copyThreadMain(void *, wait_result_t);
     const uint8_t *surfaceBytes(IOSurface *, IOMemoryDescriptor *);
@@ -310,6 +314,15 @@ private:
     IOSurface *fCopyNext;             // retained; the next surface to copy
     bool fCopyRefresh, fCopyStop, fCopyThreadDone;
     uint64_t fCopiesSkipped;
+    // WindowServer swaps a framebuffer as soon as its frame is committed (-waitUntilScheduled); the Metal device
+    // (gpu/xnu-cpu-metal) writes the pixels into the surface when the GPU is done. It need not hold WindowServer for that
+    // where the display waits by itself: on the surfaces that carry "XnuDisplayFence" (set here on each surface swapped;
+    // boot-arg xnudisplay-fence=0: not set, the device waits as before) it sets "XnuDisplayPending" when the frame is
+    // committed and clears it after the write, and the copy thread shows a surface once it is clear.
+    uint32_t fFenced[8];              // the ids of the surfaces that carry the value, the latest first
+    uint32_t fSeedFence;
+    uint64_t fSeedWaits, fSeedWaitNs, fSeedWaitMaxNs, fSeedLate;
+    bool framePending(IOSurface *);
     uint64_t fSubmitted, fStalled;          // swaps verified, VBL ticks with a queued swap clean_queue_gated did not hand over
     SwapInfo fSwapInfo[kSwapInfoRing];   // held while kSwapInfoHeld is set, sent in order afterwards
     // The surface on screen, copied again on the ticks without a swap, as a display controller scans out the buffer it shows. Core
@@ -341,6 +354,8 @@ bool XnuDisplay::start(IOService *provider)
 {
     fRefreshHz = 120;
     PE_parse_boot_argn("droidvm-display-hz", &fRefreshHz, sizeof(fRefreshHz));
+    fSeedFence = 1;
+    PE_parse_boot_argn("xnudisplay-fence", &fSeedFence, sizeof(fSeedFence));
     if (fRefreshHz < 30 || fRefreshHz > 240)
         fRefreshHz = 120;
     if (getPlatform()->getConsoleInfo(&fVideo) != kIOReturnSuccess || !fVideo.v_baseAddr || fVideo.v_depth != 32) {
@@ -552,6 +567,11 @@ IOReturn XnuDisplay::swap_begin_gated()
             IOLog("XnuDisplay: cursor %ux%u, %llu image updates, %llu moves, position %d,%d\n",
                 fCursorWidth, fCursorHeight, fCursorUpdates, fCursorMoves, fCursorOffsetX, fCursorOffsetY);
         IOLog("XnuDisplay: at most %llu frames in a second\n", fPeakFps);
+        if (fSeedWaits) {
+            IOLog("XnuDisplay: %llu waits for a frame's pixels mean %llu us max %llu us, %llu not seen\n", fSeedWaits,
+                  fSeedWaitNs / fSeedWaits / 1000, fSeedWaitMaxNs / 1000, fSeedLate);
+            fSeedWaits = fSeedWaitNs = fSeedWaitMaxNs = fSeedLate = 0;
+        }
         if (fFenceWaits)
             IOLog("XnuDisplay: %llu swaps from submit to programmed mean %llu us max %llu us\n", fFenceWaits,
                   fFenceWaitNs / fFenceWaits / 1000, fFenceWaitMaxNs / 1000);
@@ -889,7 +909,7 @@ void XnuDisplay::copyLoop()
             if (!drawn)
                 fGpuLate++;
         }
-        if (!scanOut(surface))
+        if ((refresh ? !framePending(surface) : awaitFrame(surface)) && !scanOut(surface))
             copySurface(surface, refresh);
         reinterpret_cast<OSObject *>(surface)->release();
         IOLockLock(fCopyLock);
@@ -897,6 +917,61 @@ void XnuDisplay::copyLoop()
     fCopyThreadDone = true;
     IOLockWakeup(fCopyLock, &fCopyThreadDone, false);
     IOLockUnlock(fCopyLock);
+}
+
+bool XnuDisplay::framePending(IOSurface *surface)
+{
+    uint32_t unused = 0;
+    OSObject *value = ioSurfaceCopyValue(surface, "XnuDisplayPending", &unused);
+    const bool pending = value == kOSBooleanTrue;
+    OSSafeReleaseNULL(value);
+    return pending;
+}
+
+// Wait until the frame of a swap is in its surface (fFenced). False: a newer swap came first, this one is not shown.
+bool XnuDisplay::awaitFrame(IOSurface *surface)
+{
+    const uint32_t id = ioSurfaceID(surface);
+    unsigned at = 0;
+    while (at < 8 && fFenced[at] != id)
+        at++;
+    // The surface itself says whether it carries the value: a surface of a new WindowServer can come with the id of one
+    // that is gone.
+    {
+        uint32_t unused = 0;
+        if (fSeedFence) {
+            OSObject *value = ioSurfaceCopyValue(surface, "XnuDisplayFence", &unused);
+            if (value != kOSBooleanTrue)
+                ioSurfaceSetValue(surface, "XnuDisplayFence", kOSBooleanTrue, &unused);
+            OSSafeReleaseNULL(value);
+        }
+        if (at == 8)
+            at = 7;
+    }
+    for (; at > 0; at--)
+        fFenced[at] = fFenced[at - 1];
+    fFenced[0] = id;
+    if (!framePending(surface))
+        return true;
+    const uint64_t begin = mach_absolute_time();
+    uint64_t ns = 0;
+    bool pending = true, newer = false;
+    IOLockLock(fCopyLock);
+    while (!fCopyStop && (pending = framePending(surface)) && !(newer = fCopyNext && !fCopyRefresh) && ns < 100000000) {
+        AbsoluteTime deadline;
+        clock_interval_to_deadline(250, kMicrosecondScale, &deadline);
+        IOLockSleepDeadline(fCopyLock, &fCopyNext, deadline, THREAD_UNINT);
+        absolutetime_to_nanoseconds(mach_absolute_time() - begin, &ns);
+    }
+    IOLockUnlock(fCopyLock);
+    absolutetime_to_nanoseconds(mach_absolute_time() - begin, &ns);
+    fSeedWaits++;
+    fSeedWaitNs += ns;
+    if (ns > fSeedWaitMaxNs)
+        fSeedWaitMaxNs = ns;
+    if (pending)
+        fSeedLate++;
+    return !(pending && newer);
 }
 
 // The kernel address of a surface's memory, kept prepared and mapped for the next copies.

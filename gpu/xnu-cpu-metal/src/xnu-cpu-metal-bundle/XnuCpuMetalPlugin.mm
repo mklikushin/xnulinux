@@ -373,6 +373,9 @@ static BOOL xcmRangeIsFullyWritable(void *ptr, size_t len) {
     uint32_t _iosurfaceSeed;
     BOOL _iosurfaceSyncedIn;
     BOOL _iosurfaceIsYCbCrBacking;
+    BOOL _displayFenced;
+    uint64_t _displayFenceChecked;
+    int _displayWritesPending;
     XcmBuffer *_buffer;
     NSUInteger _bufferOffset;
     NSUInteger _bufferBytesPerRow;
@@ -380,6 +383,9 @@ static BOOL xcmRangeIsFullyWritable(void *ptr, size_t len) {
 - (instancetype)initWithHandle:(Xm2vTexture *)h device:(id)dev descriptor:(MTLTextureDescriptor *)desc;
 - (void)syncFromIOSurfaceIfNeeded;
 - (void)syncToIOSurface;
+- (BOOL)displayFenced;
+- (void)displayWritePending;
+- (void)displayWriteDone;
 @end
 
 @implementation XcmTexture
@@ -407,8 +413,14 @@ static BOOL xcmRangeIsFullyWritable(void *ptr, size_t len) {
 }
 static std::mutex gIOSurfaceWriterLock;
 static std::unordered_map<uint32_t, __weak id> gIOSurfaceLastWriter;
+static std::unordered_map<uint32_t, __weak id> gIOSurfaceLastWrittenTexture;
+// A surface's writers before its last one that may not have written their pixels back yet: a frame that is not waited
+// for (-waitUntilScheduled) is still in flight when the next writer of its surface registers.
+static std::unordered_map<uint32_t, std::vector<__weak id>> gIOSurfaceEarlierWriters;
+// One copy between a surface's memory and a texture at a time (-syncToIOSurface, -syncFromIOSurfaceIfNeeded).
+static std::mutex gIOSurfaceCopyLock;
 
-static void xcmRecordIOSurfaceWriter(IOSurfaceRef surf, id cmdBuf) {
+static void xcmRecordIOSurfaceWriter(IOSurfaceRef surf, id cmdBuf, id texture) {
     if (!surf || !cmdBuf) return;
     uint32_t sid = IOSurfaceGetID(surf);
     if (!sid) return;
@@ -419,23 +431,81 @@ static void xcmRecordIOSurfaceWriter(IOSurfaceRef surf, id cmdBuf) {
             if (!w) it = gIOSurfaceLastWriter.erase(it);
             else ++it;
         }
+        for (auto it = gIOSurfaceLastWrittenTexture.begin(); it != gIOSurfaceLastWrittenTexture.end(); ) {
+            id t = it->second;
+            if (!t) it = gIOSurfaceLastWrittenTexture.erase(it);
+            else ++it;
+        }
+    }
+    id previous = gIOSurfaceLastWriter[sid];
+    if (previous && previous != cmdBuf) {
+        auto &earlier = gIOSurfaceEarlierWriters[sid];
+        for (auto it = earlier.begin(); it != earlier.end(); ) {
+            id w = *it;
+            if (!w) it = earlier.erase(it);
+            else ++it;
+        }
+        if (earlier.size() >= 4) earlier.erase(earlier.begin());
+        earlier.push_back(previous);
     }
     gIOSurfaceLastWriter[sid] = cmdBuf;
+    gIOSurfaceLastWrittenTexture[sid] = texture;
 }
+
+// The command buffer that last drew into `surf` through `texture`, nil when the surface's last writer drew through another
+// texture (or none did).
+static id xcmIOSurfaceWriterThrough(IOSurfaceRef surf, id texture) {
+    uint32_t sid = surf ? IOSurfaceGetID(surf) : 0;
+    if (!sid) return nil;
+    std::lock_guard<std::mutex> lk(gIOSurfaceWriterLock);
+    auto t = gIOSurfaceLastWrittenTexture.find(sid);
+    if (t == gIOSurfaceLastWrittenTexture.end()) return nil;
+    id last = t->second;
+    if (last != texture) return nil;
+    auto w = gIOSurfaceLastWriter.find(sid);
+    return w == gIOSurfaceLastWriter.end() ? nil : (id)w->second;
+}
+
+static BOOL xcmCommandBufferFlushedIOSurfaces(id cmdBuf);
 
 static void xcmFlushIOSurfaceWriter(IOSurfaceRef surf) {
     if (!surf) return;
     uint32_t sid = IOSurfaceGetID(surf);
     if (!sid) return;
-    id writer = nil;
+    NSMutableArray *writers = [NSMutableArray array];   // the earlier ones first
     {
         std::lock_guard<std::mutex> lk(gIOSurfaceWriterLock);
+        auto e = gIOSurfaceEarlierWriters.find(sid);
+        if (e != gIOSurfaceEarlierWriters.end()) {
+            for (auto &weak : e->second) {
+                id w = weak;
+                if (w) [writers addObject:w];
+            }
+        }
         auto it = gIOSurfaceLastWriter.find(sid);
-        if (it != gIOSurfaceLastWriter.end()) writer = it->second;
+        if (it != gIOSurfaceLastWriter.end()) {
+            id w = it->second;
+            if (w) [writers addObject:w];
+        }
     }
-    if (writer && [writer respondsToSelector:@selector(waitUntilCompleted)] &&
-        [(id<MTLCommandBuffer>)writer status] >= MTLCommandBufferStatusCommitted) {
-        [(id<MTLCommandBuffer>)writer waitUntilCompleted];
+    for (id writer in writers) {
+        if ([writer respondsToSelector:@selector(waitUntilCompleted)] &&
+            [(id<MTLCommandBuffer>)writer status] >= MTLCommandBufferStatusCommitted) {
+            [(id<MTLCommandBuffer>)writer waitUntilCompleted];
+        }
+    }
+    if (writers.count > 1) {
+        std::lock_guard<std::mutex> lk(gIOSurfaceWriterLock);
+        auto e = gIOSurfaceEarlierWriters.find(sid);
+        if (e != gIOSurfaceEarlierWriters.end()) {
+            auto &earlier = e->second;
+            for (auto it = earlier.begin(); it != earlier.end(); ) {
+                id w = *it;
+                if (!w || xcmCommandBufferFlushedIOSurfaces(w)) it = earlier.erase(it);
+                else ++it;
+            }
+            if (earlier.empty()) gIOSurfaceEarlierWriters.erase(e);
+        }
     }
 }
 
@@ -511,6 +581,10 @@ static bool xcmIOSurfacePlaneLayout(IOSurfaceRef surf, NSUInteger plane, NSUInte
 
 - (void)syncFromIOSurfaceIfNeeded {
     if (!_iosurface || !_handle) return;
+    // The surface's last writer drew through this texture and has not written the pixels back yet: the texture is ahead of
+    // the surface, there is nothing to take from it and no reason to wait for the GPU.
+    id writer = xcmIOSurfaceWriterThrough(_iosurface, self);
+    if (writer && !xcmCommandBufferFlushedIOSurfaces(writer)) return;
     xcmFlushIOSurfaceWriter(_iosurface);
     @synchronized(self) {
         if (!_iosurface || !_handle) return;
@@ -527,6 +601,7 @@ static bool xcmIOSurfacePlaneLayout(IOSurfaceRef surf, NSUInteger plane, NSUInte
                 void *base = nullptr;
                 size_t bpr = 0;
                 if (xcmIOSurfacePlaneLayout(_iosurface, _iosurfacePlane, _width, _height, _pixelFormat, &base, &bpr)) {
+                    std::lock_guard<std::mutex> copy(gIOSurfaceCopyLock);
                     xm2v_texture_replace_region(_handle, 0, 0, 0, _width, _height, 1, 0, 0, base, bpr, 0);
                 }
             }
@@ -543,7 +618,11 @@ static bool xcmIOSurfacePlaneLayout(IOSurfaceRef surf, NSUInteger plane, NSUInte
             void *base = nullptr;
             size_t bpr = 0;
             if (xcmIOSurfacePlaneLayout(_iosurface, _iosurfacePlane, _width, _height, _pixelFormat, &base, &bpr)) {
-                bool ok = xm2v_texture_get_bytes(_handle, base, bpr, 0, 0, 0, 0, _width, _height, 1, 0, 0);
+                bool ok;
+                {
+                    std::lock_guard<std::mutex> copy(gIOSurfaceCopyLock);
+                    ok = xm2v_texture_get_bytes(_handle, base, bpr, 0, 0, 0, 0, _width, _height, 1, 0, 0);
+                }
                 if (!ok) {
                     static int sSyncFailLogs = 0;
                     if (sSyncFailLogs < 10) {
@@ -569,6 +648,41 @@ static bool xcmIOSurfacePlaneLayout(IOSurfaceRef surf, NSUInteger plane, NSUInte
             _iosurfaceSeed = IOSurfaceGetSeed(_iosurface);
             _iosurfaceSyncedIn = YES;
         }
+    }
+}
+// XnuDisplay shows a framebuffer it is swapped only once the frame's pixels are in the surface, and says so on the
+// surfaces it has been swapped ("XnuDisplayFence"): the frame that draws one need not be waited for. It is told through
+// "XnuDisplayPending", true from the frame's commit until its pixels are written back.
+- (BOOL)displayFenced {
+    if (!_iosurface) return NO;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    // To compare: while the file /var/tmp/xnu-cpu-metal-wait-frames exists, every frame is waited for as before.
+    static std::atomic<uint64_t> sFileChecked{0};
+    static std::atomic<bool> sWaitFrames{false};
+    if (now - sFileChecked.load(std::memory_order_relaxed) > 250000000ull) {
+        sFileChecked.store(now, std::memory_order_relaxed);
+        sWaitFrames.store(access("/var/tmp/xnu-cpu-metal-wait-frames", F_OK) == 0, std::memory_order_relaxed);
+    }
+    if (sWaitFrames.load(std::memory_order_relaxed)) return NO;
+    if (_displayFenced) return YES;
+    if (_displayFenceChecked && now - _displayFenceChecked < 250000000ull) return NO;
+    _displayFenceChecked = now;
+    CFTypeRef value = IOSurfaceCopyValue(_iosurface, CFSTR("XnuDisplayFence"));
+    if (value) {
+        _displayFenced = (value == kCFBooleanTrue);
+        CFRelease(value);
+    }
+    return _displayFenced;
+}
+- (void)displayWritePending {
+    @synchronized(self) {
+        if (_iosurface && _displayWritesPending++ == 0) IOSurfaceSetValue(_iosurface, CFSTR("XnuDisplayPending"), kCFBooleanTrue);
+    }
+}
+- (void)displayWriteDone {
+    @synchronized(self) {
+        if (_iosurface && _displayWritesPending > 0 && --_displayWritesPending == 0)
+            IOSurfaceSetValue(_iosurface, CFSTR("XnuDisplayPending"), kCFBooleanFalse);
     }
 }
 - (id<MTLDevice>)device { return _device; }
@@ -1439,6 +1553,7 @@ static void xcmSharedEventNotified(void *context, uint64_t value) {
     BOOL _handlersFired;
     BOOL _iosurfaceFlushed;
     BOOL _retainedReleased;
+    BOOL _displayOnly;   // every surface it draws is a framebuffer the display waits for by itself (-[XcmTexture displayFenced])
     NSUInteger _protectionOptions;
 }
 - (instancetype)initWithHandle:(Xm2vCommandBuffer *)h device:(id)dev queue:(id)q;
@@ -2027,6 +2142,16 @@ static void xcmSharedEventNotified(void *context, uint64_t value) {
 
 /* ======================== CommandBuffer & Queue ======================== */
 
+// The last two frames committed that draw only display framebuffers (-waitUntilScheduled).
+static std::mutex gDisplayFrameLock;
+static XcmCommandBuffer *gDisplayFrameLast, *gDisplayFramePrevious;
+
+static BOOL xcmCommandBufferFlushedIOSurfaces(id cmdBuf) {
+    if (![cmdBuf isKindOfClass:[XcmCommandBuffer class]]) return YES;
+    XcmCommandBuffer *cb = (XcmCommandBuffer *)cmdBuf;
+    @synchronized(cb) { return cb->_iosurfaceFlushed; }
+}
+
 @implementation XcmCommandBuffer
 - (instancetype)initWithHandle:(Xm2vCommandBuffer *)h device:(id)dev queue:(id)q {
     if ((self = [super init])) {
@@ -2057,7 +2182,7 @@ static void xcmSharedEventNotified(void *context, uint64_t value) {
             added = YES;
         }
     }
-    if (added) xcmRecordIOSurfaceWriter(tex->_iosurface, self);
+    if (added) xcmRecordIOSurfaceWriter(tex->_iosurface, self, tex);
 }
 - (id<MTLDevice>)device { return _device; }
 - (id<MTLCommandQueue>)commandQueue { return _queue; }
@@ -2103,7 +2228,10 @@ static void xcmSharedEventNotified(void *context, uint64_t value) {
     @synchronized(self) {
         if (_iosurfaceFlushed) return;
         _iosurfaceFlushed = YES;
-        for (XcmTexture *tex in _dirtyIOSurfaceTextures) [tex syncToIOSurface];
+        for (XcmTexture *tex in _dirtyIOSurfaceTextures) {
+            [tex syncToIOSurface];
+            if (_displayOnly) [tex displayWriteDone];
+        }
         [_dirtyIOSurfaceTextures removeAllObjects];
     }
 }
@@ -2176,6 +2304,13 @@ static void xcmSharedEventNotified(void *context, uint64_t value) {
         nSched = _scheduledHandlers.count;
         nComp = _completedHandlers.count;
         nDirty = _dirtyIOSurfaceTextures.count;
+        _displayOnly = nDirty > 0;
+        for (XcmTexture *tex in _dirtyIOSurfaceTextures) {
+            if (![tex displayFenced]) { _displayOnly = NO; break; }
+        }
+        if (_displayOnly) {
+            for (XcmTexture *tex in _dirtyIOSurfaceTextures) [tex displayWritePending];
+        }
         nRet = _retainedResources.count;
         if (nRet) retSnapshot = [_retainedResources copy];
         needsWait = (nSched || nComp || nDirty || nRet);
@@ -2194,6 +2329,11 @@ static void xcmSharedEventNotified(void *context, uint64_t value) {
     if (_handle) {
         bool ok = xm2v_command_buffer_commit(_handle);
         if (!ok) fprintf(stderr, "XCM commit FAILED cb=%p err=%s\n", (__bridge void *)self, xm2v_last_error());
+    }
+    if (_displayOnly) {
+        std::lock_guard<std::mutex> lk(gDisplayFrameLock);
+        gDisplayFramePrevious = gDisplayFrameLast;
+        gDisplayFrameLast = self;
     }
     if (needsWait) {
         static dispatch_queue_t waitQ;
@@ -2219,8 +2359,23 @@ static void xcmSharedEventNotified(void *context, uint64_t value) {
 - (void)commitAndWaitUntilSubmitted {
     [self commit];
 }
+// WindowServer asks this of each frame before it swaps the framebuffer. A frame that draws nothing but framebuffers the
+// display waits for is scheduled once committed; it waits for the frame before it instead, so that the frames in flight
+// stay at two. Anything else that draws a surface is still waited for to the end: its reader may be another process,
+// which has only the surface's memory.
 - (void)waitUntilScheduled {
-    [self waitUntilCompleted];
+    BOOL displayOnly = NO;
+    @synchronized(self) { displayOnly = _committed && _displayOnly; }
+    if (!displayOnly) {
+        [self waitUntilCompleted];
+        return;
+    }
+    XcmCommandBuffer *previous = nil;
+    {
+        std::lock_guard<std::mutex> lk(gDisplayFrameLock);
+        if (gDisplayFrameLast == self) previous = gDisplayFramePrevious;
+    }
+    if (previous) [previous waitUntilCompleted];
 }
 - (void)waitUntilCompleted {
     if (_handle) xm2v_command_buffer_wait_until_completed(_handle, 0);
