@@ -213,22 +213,23 @@ class Session:
             pass
 
     def frames(self):
-        """A frame to the encoder whenever the dump has changed (asked twice as often as it is written), one every half
-        second while it has not, so a viewer who joins a still screen gets a picture."""
+        """Poll the framebuffer dump every 2 ms so sparse keystrokes/clicks push immediately, while capping
+        continuous pushes at --fps (plus a keepalive every 0.5 s while the screen is still)."""
         a, size = self.a, self.a.width * self.a.height * 4
         f = open(a.fb, 'rb')
         mm = mmap.mmap(f.fileno(), size, access=mmap.ACCESS_READ)
-        last, last_push, period = None, 0.0, 0.5 / a.fps
+        last, last_push, poll, min_gap = None, 0.0, 0.002, 1.0 / a.fps
         while not self.closed:
             t = time.monotonic()
             cur = mm[:size]
             self.reads += 1
-            if cur != last or t - last_push > 0.5:
+            since = t - last_push
+            if (cur != last and since >= min_gap) or since > 0.5:
                 last, last_push = cur, t
                 if self.src.emit('push-buffer', Gst.Buffer.new_wrapped(cur)) != Gst.FlowReturn.OK and not self.closed:
                     break
                 self.pushed += 1
-            time.sleep(max(0.0, period - (time.monotonic() - t)))
+            time.sleep(max(0.0, poll - (time.monotonic() - t)))
         mm.close(); f.close()
 
     def close(self, replaced=False):
