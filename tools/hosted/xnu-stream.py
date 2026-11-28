@@ -26,7 +26,7 @@ Not done yet: the pointer's image (macOS gives it as a layer of its own, which i
 browser's pointer, so it moves at once), and frames are read while the display may be writing them (a torn frame now
 and then). The page connects again by itself when the streamer or the hosted system restarts.
 """
-import argparse, json, mmap, os, select, signal, socket, struct, subprocess, sys, threading, time
+import argparse, base64, hashlib, hmac, json, mmap, os, select, signal, socket, struct, subprocess, sys, threading, time, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import gi
@@ -115,6 +115,14 @@ class Input:
 
 
 KEEP = []
+
+
+def turn_credentials(secret_file, ttl=600):
+    """RFC 5766 / coturn time-limited HMAC-SHA1 REST credentials (never static passwords)."""
+    secret = open(secret_file, 'r').read().strip().encode('utf-8')
+    username = '%d:xnu' % (int(time.time()) + ttl)
+    cred = base64.b64encode(hmac.new(secret, username.encode('utf-8'), hashlib.sha1).digest()).decode('ascii')
+    return username, cred
 MEDIA_PORTS = 8
 
 
@@ -140,10 +148,23 @@ class Session:
         self.src, self.wb = self.pipe.get_by_name('src'), self.pipe.get_by_name('wb')
         ice = self.wb.get_property('ice-agent')
         KEEP.append(ice)   # webrtcbin holds it by a floating reference, which the binding takes: never let go of it here
-        # A few ports, not one: the connections of a viewer that just left keep its port for a minute (TIME_WAIT), and
-        # the next viewer's listener could not bind it (no candidate was ever gathered: "no offer" for a minute).
-        ice.set_property('min-rtp-port', a.media_port); ice.set_property('max-rtp-port', a.media_port + MEDIA_PORTS - 1)
-        ice.set_property('ice-tcp', True); ice.set_property('ice-udp', a.advertise != '127.0.0.1')
+        self.turn_ice = None
+        if a.turn_server:
+            u, c = turn_credentials(a.turn_secret_file)
+            turn_local = a.turn_local or a.turn_server
+            uri = 'turn://%s:%s@%s?transport=udp' % (urllib.parse.quote(u, safe=''), urllib.parse.quote(c, safe=''), turn_local)
+            ice.set_property('ice-udp', True); ice.set_property('ice-tcp', False)
+            self.wb.set_property('ice-transport-policy', GstWebRTC.WebRTCICETransportPolicy.RELAY)
+            self.wb.emit('add-turn-server', uri)
+            self.turn_ice = [{
+                'urls': ['turn:%s?transport=udp' % a.turn_server, 'turn:%s?transport=tcp' % a.turn_server],
+                'username': u, 'credential': c,
+            }]
+        else:
+            # A few ports, not one: the connections of a viewer that just left keep its port for a minute (TIME_WAIT), and
+            # the next viewer's listener could not bind it (no candidate was ever gathered: "no offer" for a minute).
+            ice.set_property('min-rtp-port', a.media_port); ice.set_property('max-rtp-port', a.media_port + MEDIA_PORTS - 1)
+            ice.set_property('ice-tcp', True); ice.set_property('ice-udp', a.advertise != '127.0.0.1')
         self.offer, self.offered, self.gathered = None, threading.Event(), threading.Event()
         self.wb.connect('on-negotiation-needed', self.negotiate)
         self.wb.connect('notify::ice-gathering-state', self.gathering)
@@ -186,15 +207,19 @@ class Session:
         for line in sdp.split('\r\n'):
             if line.startswith('a=candidate:'):
                 f = line.split(' ')
-                if f[4] != a.host_ip:
-                    continue                      # one interface: the one the tunnel or the public address leads to
-                tcp = f[2].lower() == 'tcp'
-                if a.advertise == '127.0.0.1' and not (tcp and 'passive' in f):
-                    continue                      # through an ssh tunnel: the viewer connects to our TCP port
-                if tcp and 'passive' not in f:
-                    continue
-                f[4] = a.advertise
-                line = ' '.join(f)
+                if a.turn_server:
+                    if 'typ' not in f or f[f.index('typ') + 1] != 'relay':
+                        continue                  # relay-only: VM makes outbound UDP only, no host IP exposed
+                else:
+                    if f[4] != a.host_ip:
+                        continue                  # one interface: the one the tunnel or the public address leads to
+                    tcp = f[2].lower() == 'tcp'
+                    if a.advertise == '127.0.0.1' and not (tcp and 'passive' in f):
+                        continue                  # through an ssh tunnel: the viewer connects to our TCP port
+                    if tcp and 'passive' not in f:
+                        continue
+                    f[4] = a.advertise
+                    line = ' '.join(f)
             out.append(line)
         return '\r\n'.join(out)
 
@@ -267,7 +292,10 @@ async function start() {
   clearTimeout(again);
   if (pc) { pc.onconnectionstatechange = null; pc.close(); }
   ch = null; last = null;
-  pc = new RTCPeerConnection();
+  const offer = await (await fetch('session', { method: 'POST' })).json();
+  if (!offer.sdp) throw new Error(offer.error || 'no offer');
+  const cfg = offer.iceServers ? { iceServers: offer.iceServers, iceTransportPolicy: offer.iceTransportPolicy || 'relay' } : undefined;
+  pc = new RTCPeerConnection(cfg);
   pc.ontrack = e => {
     v.srcObject = e.streams[0] || new MediaStream([e.track]);
     for (const r of pc.getReceivers()) { if ('jitterBufferTarget' in r) r.jitterBufferTarget = 0; if ('playoutDelayHint' in r) r.playoutDelayHint = 0; }
@@ -285,11 +313,9 @@ async function start() {
     };
   };
   pc.onconnectionstatechange = () => { if (replaced) return; s.textContent = pc.connectionState; if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) retry(pc.connectionState); };
-  const offer = await (await fetch('session', { method: 'POST' })).json();
-  if (!offer.sdp) throw new Error(offer.error || 'no offer');
   await pc.setRemoteDescription({ type: 'offer', sdp: offer.sdp });
   await pc.setLocalDescription(await pc.createAnswer());
-  await new Promise(done => { if (pc.iceGatheringState === 'complete') done(); else { pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && done(); setTimeout(done, 1500); } });
+  await new Promise(done => { if (pc.iceGatheringState === 'complete') done(); else { pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && done(); setTimeout(done, 3000); } });
   await fetch('answer', { method: 'POST', body: pc.localDescription.sdp });
 }
 function at(e) {   // the pointer's place on the screen, 0..1 each way, inside the picture as the page scales it
@@ -344,7 +370,11 @@ def worker(a):
     signal.signal(signal.SIGTERM, lambda *_: session.close())
     signal.signal(signal.SIGUSR1, lambda *_: session.close(replaced=True))
     sdp = session.local_offer()
-    print(json.dumps({'sdp': sdp}), flush=True)
+    payload = {'sdp': sdp}
+    if session.turn_ice:
+        payload['iceServers'] = session.turn_ice
+        payload['iceTransportPolicy'] = 'relay'
+    print(json.dumps(payload), flush=True)
     if sdp is None:
         os._exit(1)
 
@@ -413,13 +443,14 @@ def serve(a, argv):
                     state['worker'], state['stats'] = w, {}
                     line = w.stdout.readline() if select.select([w.stdout], [], [], 25)[0] else ''
                     try:
-                        sdp = json.loads(line)['sdp']
-                    except (ValueError, KeyError):
-                        sdp = None
+                        offer_msg = json.loads(line)
+                        sdp = offer_msg.get('sdp')
+                    except (ValueError, KeyError, AttributeError):
+                        offer_msg, sdp = {}, None
                     if not sdp:
                         stop(); self.reply(500, 'application/json', b'{"error": "no offer"}'); return
                     threading.Thread(target=follow, args=(w,), daemon=True).start()
-                self.reply(200, 'application/json', json.dumps({'sdp': sdp}).encode())
+                self.reply(200, 'application/json', json.dumps(offer_msg).encode())
             elif self.path == '/answer' and state['worker'] and state['worker'].poll() is None:
                 try:
                     state['worker'].stdin.write(json.dumps({'sdp': body.decode('utf8', 'replace')}) + '\n')
@@ -449,9 +480,13 @@ def main():
     p.add_argument('--input', default='/var/tmp/xnu-input'); p.add_argument('--fps', type=int, default=60)
     p.add_argument('--http', default='127.0.0.1:8555'); p.add_argument('--media-port', type=int, default=8556)
     p.add_argument('--advertise', default='127.0.0.1'); p.add_argument('--host-ip', default='')
+    p.add_argument('--turn-server', default=''); p.add_argument('--turn-local', default='')
+    p.add_argument('--turn-secret-file', default='')
     p.add_argument('--codec', choices=('h264', 'vp8'), default='h264'); p.add_argument('--kbps', type=int, default=8000)
     p.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     a = p.parse_args()
+    if a.turn_server and not a.turn_secret_file:
+        sys.exit('--turn-server requires --turn-secret-file')
     a.width, a.height = (int(v) for v in a.screen.split('x'))
     if os.path.getsize(a.fb) < a.width * a.height * 4:
         sys.exit('%s is smaller than a %s screen: is the hosted system up, with xnu.ko fb_dump=%s?' % (a.fb, a.screen, a.fb))
@@ -460,7 +495,10 @@ def main():
     if a.worker:
         worker(a)
         return
-    print('page http://%s/  media %s:%d-%d (offered as %s)  %s %d kbit/s' % (a.http, a.host_ip, a.media_port, a.media_port + MEDIA_PORTS - 1, a.advertise, a.codec, a.kbps), flush=True)
+    if a.turn_server:
+        print('page http://%s/  media relay via %s (vm via %s)  %s %d kbit/s' % (a.http, a.turn_server, a.turn_local or a.turn_server, a.codec, a.kbps), flush=True)
+    else:
+        print('page http://%s/  media %s:%d-%d (offered as %s)  %s %d kbit/s' % (a.http, a.host_ip, a.media_port, a.media_port + MEDIA_PORTS - 1, a.advertise, a.codec, a.kbps), flush=True)
     serve(a, [x for x in sys.argv[1:] if x != '--worker'])
 
 
