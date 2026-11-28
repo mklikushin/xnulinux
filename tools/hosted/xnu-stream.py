@@ -231,9 +231,15 @@ class Session:
             time.sleep(max(0.0, period - (time.monotonic() - t)))
         mm.close(); f.close()
 
-    def close(self):
+    def close(self, replaced=False):
         if not self.closed:
             self.closed = True
+            if replaced and self.channel:
+                try:
+                    self.channel.emit('send-string', json.dumps({'t': 'replaced'}))
+                    time.sleep(0.05)
+                except Exception:
+                    pass
             self.input.release_all()
             self.pipe.set_state(Gst.State.NULL)
             os._exit(0)   # a viewer is a process: its ports and its encoder go with it
@@ -247,14 +253,17 @@ video{position:absolute;inset:0;margin:auto;max-width:100%;max-height:100%;outli
 <video id=v autoplay muted playsinline tabindex=0></video><div id=s>connecting</div>
 <script>
 const v = document.getElementById('v'), s = document.getElementById('s');
-let pc, ch, last = null;
+let pc, ch, last = null, replaced = false;
 const send = m => { if (ch && ch.readyState === 'open') ch.send(JSON.stringify(m)); };
 let again = 0;
 function retry(why) {   // the streamer or the hosted system restarted, or the first try came too early: connect again
+  if (replaced) return;
   s.textContent = why + ', connecting again';
   clearTimeout(again); again = setTimeout(() => start().catch(e => retry('failed: ' + e.message)), 2000);
 }
 async function start() {
+  replaced = false;
+  clearTimeout(again);
   if (pc) { pc.onconnectionstatechange = null; pc.close(); }
   ch = null; last = null;
   pc = new RTCPeerConnection();
@@ -262,8 +271,19 @@ async function start() {
     v.srcObject = e.streams[0] || new MediaStream([e.track]);
     for (const r of pc.getReceivers()) { if ('jitterBufferTarget' in r) r.jitterBufferTarget = 0; if ('playoutDelayHint' in r) r.playoutDelayHint = 0; }
   };
-  pc.ondatachannel = e => { ch = e.channel; };
-  pc.onconnectionstatechange = () => { s.textContent = pc.connectionState; if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) retry(pc.connectionState); };
+  pc.ondatachannel = e => {
+    ch = e.channel;
+    ch.onmessage = ev => {
+      try {
+        if (JSON.parse(ev.data).t === 'replaced') {
+          replaced = true;
+          clearTimeout(again);
+          s.textContent = 'taken over by another tab — click to reconnect';
+        }
+      } catch {}
+    };
+  };
+  pc.onconnectionstatechange = () => { if (replaced) return; s.textContent = pc.connectionState; if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) retry(pc.connectionState); };
   const offer = await (await fetch('session', { method: 'POST' })).json();
   if (!offer.sdp) throw new Error(offer.error || 'no offer');
   await pc.setRemoteDescription({ type: 'offer', sdp: offer.sdp });
@@ -281,7 +301,7 @@ v.addEventListener('pointermove', e => { for (const c of (e.getCoalescedEvents ?
 // The modifiers as the browser has them now, sent with every button, key and wheel message: a key-up that never reached
 // this page (a system shortcut took the keyboard away with Command down) must not leave the key down on the other side.
 const mods = e => (e.metaKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.altKey ? 4 : 0) | (e.shiftKey ? 8 : 0);
-v.addEventListener('pointerdown', e => { v.focus(); v.setPointerCapture(e.pointerId); send({ t: 'm', ...at(e) }); send({ t: 'b', b: e.button, d: 1, mods: mods(e) }); e.preventDefault(); });
+v.addEventListener('pointerdown', e => { if (replaced) { start().catch(err => retry('failed: ' + err.message)); e.preventDefault(); return; } v.focus(); v.setPointerCapture(e.pointerId); send({ t: 'm', ...at(e) }); send({ t: 'b', b: e.button, d: 1, mods: mods(e) }); e.preventDefault(); });
 v.addEventListener('pointerup', e => { send({ t: 'm', ...at(e) }); send({ t: 'b', b: e.button, d: 0, mods: mods(e) }); e.preventDefault(); });
 v.addEventListener('contextmenu', e => e.preventDefault());
 // Scrolling goes over by the pixel, as the browser reports it (two fingers on a trackpad, either way). With ?gestures=1
@@ -321,6 +341,7 @@ def worker(a):
     Gst.init(None)
     session = Session(a, Input(a.input))
     signal.signal(signal.SIGTERM, lambda *_: session.close())
+    signal.signal(signal.SIGUSR1, lambda *_: session.close(replaced=True))
     sdp = session.local_offer()
     print(json.dumps({'sdp': sdp}), flush=True)
     if sdp is None:
@@ -346,10 +367,13 @@ def worker(a):
 def serve(a, argv):
     state = {'worker': None, 'stats': {}, 'lock': threading.Lock()}
 
-    def stop():
+    def stop(replaced=False):
         w = state['worker']
         if w and w.poll() is None:
-            w.terminate()
+            if replaced:
+                w.send_signal(signal.SIGUSR1)
+            else:
+                w.terminate()
             try:
                 w.wait(3)
             except subprocess.TimeoutExpired:
@@ -382,7 +406,7 @@ def serve(a, argv):
             body = self.rfile.read(int(self.headers.get('Content-Length') or 0))
             if self.path == '/session':       # one viewer: a new one replaces the old
                 with state['lock']:
-                    stop()
+                    stop(replaced=True)
                     w = subprocess.Popen([sys.executable, os.path.abspath(__file__), '--worker'] + argv, stdin=subprocess.PIPE,
                                          stdout=subprocess.PIPE, text=True, bufsize=1)
                     state['worker'], state['stats'] = w, {}
