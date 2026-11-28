@@ -1609,16 +1609,25 @@ static int monitor_fn(void *arg)
 	return 0;
 }
 
-/* The framebuffer to fb_dump every fb_dump_ms (a host thread: plain Linux context, XNU keeps running on its CPU). */
+/* The framebuffer to fb_dump every fb_dump_ms (a host thread: plain Linux context, XNU keeps running on its CPU).
+ * Writes an 8-byte little-endian sequence counter at offset FB_SIZE (odd while writing, even when complete) so a
+ * reader mapping the file can reject half-written frames without breaking tools that read only 0..FB_SIZE. */
 static void *fb_thread;
 static int fb_fn(void *arg)
 {
 	void *f = fki_file_open(fb_dump, 1, 0);
+	u64_t seq = 0;
 	(void)arg;
 	if (!f) { logs("xnu: cannot open fb_dump (create the file first)"); return 0; }
 	while (!fki_thread_should_stop()) {
 		fki_msleep(fb_dump_ms);
+		seq++;
+		fki_file_pwrite(f, &seq, sizeof(seq), FB_SIZE);
+		__sync_synchronize();
 		fki_file_pwrite(f, (unsigned char *)img.region.va + fb_off, FB_SIZE, 0);
+		__sync_synchronize();
+		seq++;
+		fki_file_pwrite(f, &seq, sizeof(seq), FB_SIZE);
 	}
 	fki_file_close(f);
 	return 0;

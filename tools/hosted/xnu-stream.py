@@ -239,19 +239,48 @@ class Session:
 
     def frames(self):
         """Poll the framebuffer dump every 2 ms so sparse keystrokes/clicks push immediately, while capping
-        continuous pushes at --fps (plus a keepalive every 0.5 s while the screen is still)."""
+        continuous pushes at --fps (plus a keepalive every 0.5 s while the screen is still). When xnu.ko writes
+        the 8-byte seqlock at offset size (odd while writing, even when complete), retry torn reads."""
         a, size = self.a, self.a.width * self.a.height * 4
         f = open(a.fb, 'rb')
-        mm = mmap.mmap(f.fileno(), size, access=mmap.ACCESS_READ)
-        last, last_push, poll, min_gap = None, 0.0, 0.002, 1.0 / a.fps
+        fsize = os.fstat(f.fileno()).st_size
+        mm = mmap.mmap(f.fileno(), size + 8 if fsize >= size + 8 else size, access=mmap.ACCESS_READ)
+        last, last_seq, last_push, poll, min_gap = None, 0, 0.0, 0.002, 1.0 / a.fps
         while not self.closed:
             t = time.monotonic()
-            cur = mm[:size]
-            self.reads += 1
+            if len(mm) < size + 8 and os.fstat(f.fileno()).st_size >= size + 8:
+                mm.close()
+                mm = mmap.mmap(f.fileno(), size + 8, access=mmap.ACCESS_READ)
             since = t - last_push
-            if (cur != last and since >= min_gap) or since > 0.5:
+            cur = None
+            if len(mm) >= size + 8:
+                for _ in range(6):
+                    s1 = struct.unpack_from('<Q', mm, size)[0]
+                    if s1 == 0:
+                        cur = mm[:size]
+                        break
+                    if s1 & 1:
+                        time.sleep(0.0005)
+                        continue
+                    if s1 == last_seq and last is not None and since <= 0.5:
+                        break
+                    buf = mm[:size]
+                    s2 = struct.unpack_from('<Q', mm, size)[0]
+                    if s1 == s2:
+                        cur, last_seq = buf, s1
+                        break
+                    time.sleep(0.0005)
+            else:
+                cur = mm[:size]
+            self.reads += 1
+            if cur is not None and ((cur != last and since >= min_gap) or since > 0.5):
                 last, last_push = cur, t
                 if self.src.emit('push-buffer', Gst.Buffer.new_wrapped(cur)) != Gst.FlowReturn.OK and not self.closed:
+                    break
+                self.pushed += 1
+            elif cur is None and last is not None and since > 0.5:
+                last_push = t
+                if self.src.emit('push-buffer', Gst.Buffer.new_wrapped(last)) != Gst.FlowReturn.OK and not self.closed:
                     break
                 self.pushed += 1
             time.sleep(max(0.0, poll - (time.monotonic() - t)))
