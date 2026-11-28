@@ -2677,8 +2677,13 @@ static id xcmDev_newBufferNoCopy(id self, SEL, void *pointer, NSUInteger length,
         const char *e = getenv("XNU_CPU_METAL_FORCE_NOCOPY_FALLBACK");
         sForceNoCopyFallback = (e && e[0] && e[0] != '0') ? 1 : 0;
     }
+    // Only import caller memory directly via VK_EXT_external_memory_host when the
+    // caller supplies a deallocator (transferring exclusive ownership until dealloc).
+    // With deallocator == nil, callers such as CoreAnimation can unmap `pointer`
+    // while in-flight command buffers are still executing in lavapipe (causing
+    // EXC_BAD_ACCESS in util_copy_box).
     void *ctx = (!sForceNoCopyFallback && deallocator) ? (__bridge_retained void *)[deallocator copy] : nullptr;
-    Xm2vBuffer *b = sForceNoCopyFallback ? nullptr :
+    Xm2vBuffer *b = (sForceNoCopyFallback || !deallocator) ? nullptr :
         xm2v_buffer_new_no_copy_dealloc(gXm2vDevice, pointer, length, opts,
                                         ctx ? xcmBufferDeallocCallback : nullptr, ctx);
     if (!b) {
