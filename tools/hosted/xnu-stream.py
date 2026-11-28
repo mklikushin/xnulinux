@@ -294,7 +294,7 @@ async function start() {
   ch = null; last = null;
   const offer = await (await fetch('session', { method: 'POST' })).json();
   if (!offer.sdp) throw new Error(offer.error || 'no offer');
-  const cfg = offer.iceServers ? { iceServers: offer.iceServers, iceTransportPolicy: offer.iceTransportPolicy || 'relay' } : undefined;
+  const cfg = offer.iceServers ? { iceServers: offer.iceServers, iceTransportPolicy: offer.iceTransportPolicy || 'all' } : undefined;
   pc = new RTCPeerConnection(cfg);
   pc.ontrack = e => {
     v.srcObject = e.streams[0] || new MediaStream([e.track]);
@@ -373,7 +373,7 @@ def worker(a):
     payload = {'sdp': sdp}
     if session.turn_ice:
         payload['iceServers'] = session.turn_ice
-        payload['iceTransportPolicy'] = 'relay'
+        payload['iceTransportPolicy'] = 'all'
     print(json.dumps(payload), flush=True)
     if sdp is None:
         os._exit(1)
