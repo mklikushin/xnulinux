@@ -130,13 +130,13 @@ class Session:
                    'target-bitrate=%d lag-in-frames=0 ! rtpvp8pay ! application/x-rtp,media=video,encoding-name=VP8,clock-rate=90000,payload=96'
                    % (a.kbps * 1000))
         else:
-            enc = ('x264enc tune=zerolatency speed-preset=ultrafast bitrate=%d key-int-max=600 bframes=0 threads=3 ! '
+            enc = ('x264enc tune=zerolatency speed-preset=ultrafast bitrate=%d key-int-max=600 bframes=0 threads=3 sliced-threads=true ! '
                    'video/x-h264,profile=constrained-baseline ! rtph264pay config-interval=-1 aggregate-mode=zero-latency ! '
                    'application/x-rtp,media=video,encoding-name=H264,clock-rate=90000,payload=96' % a.kbps)
         self.pipe = Gst.parse_launch(
             'appsrc name=src is-live=true format=time do-timestamp=true block=false max-buffers=2 leaky-type=downstream '
-            'caps=video/x-raw,format=BGRx,width=%d,height=%d,framerate=0/1 ! videoconvert n-threads=2 ! video/x-raw,format=I420 ! '
-            '%s ! webrtcbin name=wb bundle-policy=max-bundle' % (w, h, enc))
+            'caps=video/x-raw,format=BGRx,width=%d,height=%d,framerate=%d/1 ! videoconvert n-threads=2 ! video/x-raw,format=I420 ! '
+            '%s ! webrtcbin name=wb bundle-policy=max-bundle' % (w, h, a.fps, enc))
         self.src, self.wb = self.pipe.get_by_name('src'), self.pipe.get_by_name('wb')
         ice = self.wb.get_property('ice-agent')
         KEEP.append(ice)   # webrtcbin holds it by a floating reference, which the binding takes: never let go of it here
