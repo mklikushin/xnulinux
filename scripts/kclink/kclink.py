@@ -309,10 +309,17 @@ def main():
         if spec['bundle'] in keep or spec['bundle'] in (s['bundle'] for s, _ in specs):
             fail(f'{path}: {spec["bundle"]} is in the collection already')
         objects = json.loads(Path(spec['objects']).read_text())
-        specs.append((spec, kextld.Kext(spec, objects)))
+        try:
+            specs.append((spec, kextld.Kext(spec, objects)))
+        except kextld.LinkError as e:
+            fail(f'{spec["bundle"]}: {e}')
     for spec, kx in specs:
         addrs = {}
-        for seg, (size, al) in kx.layout().items():
+        try:
+            sizes = kx.layout()
+        except kextld.LinkError as e:
+            fail(f'{spec["bundle"]}: {e}')
+        for seg, (size, al) in sizes.items():
             region = KEXT_REGION[seg]
             off = holes[region].fit(size, al)
             if off is None:

@@ -6,14 +6,25 @@ VIRGL ?= $(shell pkg-config --exists virglrenderer && echo 1)
 SRC = xnudrmd.c
 ifeq ($(VIRGL),1)
 SRC += xnudrmd_virgl.c
-CFLAGS += -DXNUDRM_VIRGL $(shell pkg-config --cflags virglrenderer)
+# (override: these are needed to compile xnudrmd_virgl.c at all, also when CFLAGS comes from the command line)
+override CFLAGS += -DXNUDRM_VIRGL $(shell pkg-config --cflags virglrenderer)
 LDLIBS += $(shell pkg-config --libs virglrenderer)
 endif
-xnudrmd: $(SRC) xnudrm_proto.h xnudrmd.h
+xnudrmd: $(SRC) xnudrm_proto.h xnudrmd.h .virgl
 	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDLIBS)
-# the backend alone, on the host's Vulkan driver (no fki, no hosted system)
-test-virgl: test/virgl_smoke.c xnudrmd_virgl.c xnudrm_proto.h xnudrmd.h
-	$(CC) $(CFLAGS) -I. -o test/virgl_smoke test/virgl_smoke.c xnudrmd_virgl.c $(LDLIBS)
-	test/virgl_smoke
+# with or without the backend is part of what xnudrmd is made from: virglrenderer installed after a first build (as
+# tools/dgx-spark's README has it) builds xnudrmd again, where make saw nothing newer than it
+.virgl: FORCE
+	@echo '$(VIRGL)' | cmp -s - $@ || echo '$(VIRGL)' > $@
+FORCE:
+# xnudrmd with the backend, as a Venus client meets it, on the host's Vulkan drivers (no fki, no hosted system)
+ifeq ($(VIRGL),1)
+test-virgl: test/virgl.c $(SRC) xnudrm_proto.h xnudrmd.h
+	$(CC) $(CFLAGS) -I. -o test/virgl test/virgl.c xnudrmd_virgl.c $(LDLIBS)
+	test/virgl
+else
+test-virgl:
+	@echo "xnudrmd's virglrenderer backend: NOT TESTED: no virglrenderer to build it with (pkg-config virglrenderer)"
+endif
 clean:
-	rm -f xnudrmd test/virgl_smoke
+	rm -f xnudrmd test/virgl .virgl

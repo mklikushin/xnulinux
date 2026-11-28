@@ -16,20 +16,30 @@
 #   FB_DUMP (/var/tmp/xnu-fb.raw)  KEYSTORE (/var/tmp/xnu-keystore.bin)  TRUSTCACHE (xnu/trustcache-mac.bin; empty: none)
 #   IMAGE (xnu/kc.bin: the kernel collection under /lib/firmware)  GPU (auto|off)  CPUS (1: the hosted system's CPUs, 32 at most)  XNU_ARGS (more xnu.ko parameters)
 set -euo pipefail
+# a relative MAC_CONF or DISK in the environment is a file where the caller is (docs/free-kc.md: MAC_CONF=pd.conf DISK=pd.img)
+for v in MAC_CONF DISK; do [[ ${!v:-/} = /* ]] || printf -v "$v" %s "$PWD/${!v}"; done
 cd "$(dirname "$0")/.."
 [ -f /etc/xnulinux.conf ] && . /etc/xnulinux.conf	# for stop as well: the sync is typed into this system's CONSOLE_IN
+irqs_back() {	# Linux's device interrupts back on the CPUs they had before the start took them off XNU's (/run: gone at a reboot, as they are)
+  local f v; [ -s /run/xnu-irq-affinity ] || return 0
+  while read -r f v; do [ -n "$v" ] && [ -e "$f" ] && echo "$v" | sudo tee "$f" >/dev/null 2>&1 || true; done < /run/xnu-irq-affinity
+  sudo rm -f /run/xnu-irq-affinity
+}
 if [ "${1:-}" = stop ]; then	# end the running hosted system (its disk synced first) and remove xnu.ko
   if [ ! -d /sys/module/xnu ]; then
     sudo systemctl stop xnudrmd 2>/dev/null || true
+    irqs_back
     echo "no hosted system is running"; exit 0
   fi
   printf 'sync\n' >> "${CONSOLE_IN:-/var/tmp/console-in}"; sleep 3
   echo 1 | sudo tee /sys/module/xnu/parameters/stop_run >/dev/null
   # every XNU CPU sees the stop at its next host call; one in a long one (disk I/O while the VM shuts down) takes a while
   for _ in $(seq 1 600); do pgrep -f "insmod xnu-ko/xnu.ko" >/dev/null || break; sleep 0.2; done
-  if [ -d /sys/module/xnu ]; then sudo rmmod xnu; fi
+  # (under systemd --wait's collect unloads it too, and may get there between this test and the rmmod: not a failed stop)
+  if [ -d /sys/module/xnu ]; then e=$(sudo rmmod xnu 2>&1) || [ ! -d /sys/module/xnu ] || { echo "$e" >&2; exit 1; }; fi
   sudo systemctl stop xnudrmd 2>/dev/null || true
   for f in /sys/devices/system/cpu/cpu*/cpuidle/state[1-9]*/disable; do [ -e "$f" ] && echo 0 | sudo tee "$f" >/dev/null 2>&1 || true; done	# XNU's CPUs are Linux's again
+  irqs_back
   echo "hosted system stopped"
   exit
 fi
@@ -51,11 +61,19 @@ build() {	# a module; on failure its compiler errors, modpost's, and what make s
 build fki-ko
 build xnu-ko "KBUILD_EXTRA_SYMBOLS=$PWD/fki-ko/Module.symvers"
 # XNU prints a lot (console lines, kprintf): to the ring buffer only (journalctl -k, scripts/vm-dmesg-shell.sh), not the
-# VM console, where a CPU printing waits for the console with interrupts off
-sudo dmesg -n "${CONLEVEL:-1}"
+# VM console, where a CPU printing waits for the console with interrupts off. Level 2, not 1: the console takes what is
+# below its level, and fki_log_alert's lines (an XNU panic, an XNU CPU gone silent) are KERN_ALERT (1)
+sudo dmesg -n "${CONLEVEL:-2}"
 # fki has the hosted kernel's DRAM from its load at boot (scripts/vm-install-fki-service.sh): reload it only when it changed,
 # with the same carve-out
 CARVE="carve_base=$(cat /sys/module/fki/parameters/carve_base 2>/dev/null || echo 0x200000000) carve_mb=$(cat /sys/module/fki/parameters/carve_mb 2>/dev/null || echo 8156)"
+# Not loaded at all: its load at boot failed (after a kernel update fki.ko was still the old kernel's, until the build
+# above). Then with what xnulinux-fki.service loads it with, which is where a host's own carve-out is written down.
+if [ ! -d /sys/module/fki ]; then
+  # (no such unit on a host where fki.ko is loaded by hand: sed's failure must not end the script here, under set -e)
+  UNIT_ARGS=$(sed -n 's|^ExecStart=.*/fki-ko/fki\.ko  *||p' /etc/systemd/system/xnulinux-fki.service 2>/dev/null | head -1 || true)
+  [ -z "$UNIT_ARGS" ] || CARVE=$UNIT_ARGS
+fi
 # (an fki.ko from before cpu_list has none: set -e must not stop here)
 CPULIST=$(tr -d '\n' 2>/dev/null < /sys/module/fki/parameters/cpu_list || true); [ -z "$CPULIST" ] || CARVE="$CARVE cpu_list=$CPULIST"
 if [ "$(cat /sys/module/fki/srcversion 2>/dev/null)" != "$(modinfo -F srcversion fki-ko/fki.ko)" ]; then
@@ -87,6 +105,8 @@ m = (1 << $NCPU) - 1
 for c in l: m &= ~(1 << c)
 h = format(m, 'x')	# Linux reads a CPU mask in comma-separated groups of 32 bits
 print(','.join(reversed([h[max(i - 8, 0):i] for i in range(len(h), 0, -8)])))")
+  # what they were, for the stop or the end of the run to give back (kept when a start finds it there: the values are the first start's)
+  [ -s /run/xnu-irq-affinity ] || for f in /proc/irq/default_smp_affinity /proc/irq/*/smp_affinity; do echo "$f $(cat "$f" 2>/dev/null)"; done | sudo tee /run/xnu-irq-affinity >/dev/null
   echo "$MASK" | sudo tee /proc/irq/default_smp_affinity >/dev/null 2>&1 || true
   for f in /proc/irq/*/smp_affinity; do echo "$MASK" | sudo tee "$f" >/dev/null 2>&1 || true; done
   HOSTCPUS=$(python3 -c "print(','.join(str(c) for c in range($NCPU) if 0x${MASK//,/} >> c & 1))")
@@ -161,8 +181,23 @@ for try in 1 2 3 4 5 6 7 8 9; do
   fi
   echo "no contiguous memory for XNU yet: trying again in 20 s"; sleep 20
 done
-echo "booting: console scripts/xnu-console.sh, screen tools/hosted/fb2png.py $FB_DUMP"
-[ $WAIT = 1 ] || exit 0
+# insmod gone and no xnu.ko: it did not load (no disk or collection, a parameter out of range)
+if ! pgrep -f "insmod xnu-ko/xnu.ko" >/dev/null && [ ! -d /sys/module/xnu ]; then
+  # with what xnu.ko itself said last: insmod only has the error number's words, and for a file xnu.ko did not find (the
+  # collection, the trust cache, the disk: -2) those are "Unknown symbol in module"
+  echo "xnu.ko did not load: $(cat /var/tmp/xnu-insmod.log)" >&2
+  # (xnu.ko said nothing when Linux itself refused the load, as for a parameter longer than it takes: grep's status
+  # must not end the script here, before the GPU bridge is stopped)
+  { sudo dmesg | grep -a "fki: xnu: " | tail -3 | sed 's/^\[[^]]*\] */  /' >&2; } || true
+  if [ $WAIT = 0 ]; then
+    sudo systemctl stop xnudrmd 2>/dev/null || true
+    exit 1
+  fi
+  # --wait has said why as well, and goes on to keep the run's log and to end with 3, as for any run that ended
+else
+  echo "booting: console scripts/xnu-console.sh, screen tools/hosted/fb2png.py $FB_DUMP"
+  [ $WAIT = 1 ] || exit 0
+fi
 
 # --wait: until the run ends (insmod returns), then keep its kernel log and say how it ended: 0 a halt (from inside, or
 # a stop asked for), 2 an XNU panic, 4 a restart the hosted system asked for, 3 the run ended otherwise
@@ -170,21 +205,28 @@ collect() {	# the run's kernel log, kept; the status says how it ended
   local LOGDIR=/var/log/xnulinux LOG
   # insmod has returned but xnu.ko stays loaded after a run that ended by itself (a panic, a halt): unload it, or the
   # next start (systemd's restart after a panic) finds it and refuses
-  if [ -d /sys/module/xnu ]; then sudo rmmod xnu || echo "xnu.ko did not unload" >&2; fi
+  # (a stop that was asked for unloads it as well: whichever of the two gets there second finds it gone)
+  if [ -d /sys/module/xnu ]; then sudo rmmod xnu 2>/dev/null || [ ! -d /sys/module/xnu ] || echo "xnu.ko did not unload" >&2; fi
   sudo systemctl stop xnudrmd 2>/dev/null || true
   # XNU's CPUs are Linux's again, as after a stop: a run that ended by itself otherwise left them out of the deep idle states
   for f in /sys/devices/system/cpu/cpu*/cpuidle/state[1-9]*/disable; do [ -e "$f" ] && echo 0 | sudo tee "$f" >/dev/null 2>&1 || true; done
+  irqs_back
   sudo mkdir -p "$LOGDIR"
   LOG=$LOGDIR/run-$(date -d @"$START" +%Y%m%d-%H%M%S).log
-  { cat /var/tmp/xnu-insmod.log; sudo journalctl -k -q -o short-monotonic --no-pager --since @"$START" | grep -a "fki:"; } |
+  # (no line of fki's at all when xnu.ko did not load: set -e must not end the script here, before it says how the run ended)
+  { cat /var/tmp/xnu-insmod.log; sudo journalctl -k -q -o short-monotonic --no-pager --since @"$START" | grep -a "fki:" || true; } |
     sudo tee "$LOG" >/dev/null
   ls -1t "$LOGDIR"/run-*.log | tail -n +21 | xargs -r sudo rm -f	# the last 20 runs
-  if grep -aq "XNU panic" "$LOG"; then echo "the hosted system panicked: $LOG" >&2; return 2; fi
+  # how it ended is in xnu.ko's own lines, not in what the hosted console printed (the log has those too: a console that
+  # showed the words "XNU panic" turned a clean shutdown into a panic, and systemd started the system again)
+  # (grep -c, not -q: under pipefail the first grep, cut off by an early -q, fails with SIGPIPE on a long log)
+  said() { grep -av "fki: darwin console: " "$LOG" | grep -ac "$1" >/dev/null; }
+  if said "XNU panic"; then echo "the hosted system panicked: $LOG" >&2; return 2; fi
   # shut down from inside (shutdown -h, the Apple menu): a halt is a clean end; a restart ends with 4 for systemd to start it again
   # (checked before the stop: the other CPUs log "run stopped by the host" as they leave after it)
-  if grep -aq "xnu: the hosted system halted" "$LOG"; then echo "the hosted system shut down: $LOG"; return 0; fi
-  if grep -aq "xnu: the hosted system asked for a restart" "$LOG"; then echo "the hosted system restarts: $LOG"; return 4; fi
-  if [ "${1:-}" = stopped ] || grep -aq "run stopped by the host" "$LOG"; then echo "the hosted system stopped: $LOG"; return 0; fi
+  if said "xnu: the hosted system halted"; then echo "the hosted system shut down: $LOG"; return 0; fi
+  if said "xnu: the hosted system asked for a restart"; then echo "the hosted system restarts: $LOG"; return 4; fi
+  if [ "${1:-}" = stopped ] || said "run stopped by the host"; then echo "the hosted system stopped: $LOG"; return 0; fi
   echo "the run ended: $LOG" >&2; return 3
 }
 # systemctl stop: ExecStop (xnulinux-boot.sh stop) ends the run, then systemd sends this script SIGTERM

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Build the arm64 host Linux (4K pages like the UniXNU 4K XNU machine layer, 48-bit VA, user PAC) with the FKI patch, plus a busybox initramfs.
 set -euo pipefail
-P=$(cd "$(dirname "$0")/.." && pwd); W=${W:?W: a work directory holding src/linux (a Linux tree); the build goes to $W/out/linux}; L=$W/src/linux; O=$W/out/linux; mkdir -p $O
+P=$(cd "$(dirname "$0")/.." && pwd); W=${W:?W: a work directory holding src/linux (a Linux tree); the build goes to $W/out/linux}; W=$(cd "$W" && pwd); L=$W/src/linux; O=$W/out/linux; mkdir -p $O
 cd $L
 git checkout -q -- drivers/Kconfig drivers/Makefile
 rsync -a $P/linux/ ./

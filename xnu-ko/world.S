@@ -343,6 +343,12 @@ xnu_world_upcall_el0:
 	ldp	x27, x28, [x9, #176]
 	ldp	x29, x30, [x9, #192]
 	ret
+/*
+ * The host could not switch PAC keys. XNU is not returned to: the run ends as from a hook that says so. After the first
+ * swap XNU's keys are still loaded, and fki_leave loads Linux's once more (the host's own keys that cannot be put back
+ * are fki's to give up on); after the second, Linux's are. Linux's TPIDR_EL0 is live in both.
+ */
 .Lpac_fail_el0:
 	bl	xnu_world_pac_abort_el0
+	b	xnu_world_abort_el0
 	.size	xnu_world_upcall_el0, . - xnu_world_upcall_el0

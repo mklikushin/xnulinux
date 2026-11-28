@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -105,13 +106,21 @@ static void t_signal(void)
 	CHECK(closed[1] == 1);
 	CHECK(xnudrm_close(f) == 0 && xnudrm_close(g) == 0 && closed[1] == 1);
 }
-static void t_close(void)	/* a sandbox fence's last descriptor closes it in xnudrmd */
+static void t_close(void)	/* a fence's last descriptor closes it in xnudrmd */
 {
 	int n = node(), f = submit(n), g = xnudrm_dupfd_cloexec(f);
 	xnudrm_close(f);
 	CHECK(closed[1] == 0 && wait_fd(g, 0) == 0);
 	xnudrm_close(g);
-	CHECK(closed[1] == sandbox && nsfds == 0);
+	CHECK(closed[1] == 1 && nsfds == 0 && nfences == 0);
+}
+static void t_unwaited(void)	/* fences dropped unwaited (vkResetFences, vkDestroyFence): nothing of one stays, however many */
+{
+	int n = node();
+	struct rlimit few = { 64, 64 };
+	CHECK(setrlimit(RLIMIT_NOFILE, &few) == 0);
+	for (int i = 1; i <= 300; i++) CHECK(xnudrm_close(submit(n)) == 0 && closed[i] == 1);
+	CHECK(nfences == 0 && nsfds == 0);
 }
 static void t_node_close(void)	/* the order of vkDestroyInstance: fences nobody waited for, then the node */
 {
@@ -212,7 +221,7 @@ int main(void)
 	while ((fd = open("/dev/null", O_RDWR)) >= 0 && fd < 3) ;	/* the tests count on descriptors 0-2 being taken */
 	if (fd > 2) close(fd);
 	static const struct { const char *name; void (*f)(void); } tests[] = {
-		{ "signal", t_signal }, { "close", t_close }, { "node close", t_node_close }, { "stale fd, new", t_stale_new },
+		{ "signal", t_signal }, { "close", t_close }, { "unwaited", t_unwaited }, { "node close", t_node_close }, { "stale fd, new", t_stale_new },
 		{ "stale fd, dup", t_stale_dup }, { "multi", t_multi }, { "mixed", t_mixed },
 		{ "error", t_error }, { "full", t_full }, { "dup flags", t_dup_flags }, { "denials", t_denials },
 	};

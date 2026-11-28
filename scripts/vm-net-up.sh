@@ -11,8 +11,10 @@ sudo sysctl -q -w net.ipv4.ip_forward=1
 # the default route's interface: the word after "dev", wherever it is ("default dev wg0 scope link" has no gateway before
 # it, and a multipath route names its interfaces on the next-hop lines)
 up=$(ip route show default | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
-sudo iptables -t nat -C POSTROUTING -s 192.168.77.0/24 -o "$up" -j MASQUERADE 2>/dev/null ||
-  sudo iptables -t nat -A POSTROUTING -s 192.168.77.0/24 -o "$up" -j MASQUERADE
+if [ -n "$up" ]; then
+  sudo iptables -t nat -C POSTROUTING -s 192.168.77.0/24 -o "$up" -j MASQUERADE 2>/dev/null ||
+    sudo iptables -t nat -A POSTROUTING -s 192.168.77.0/24 -o "$up" -j MASQUERADE
+fi
 sudo iptables -C FORWARD -i xnu0 -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD -i xnu0 -j ACCEPT
 sudo iptables -C FORWARD -o xnu0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null ||
   sudo iptables -I FORWARD -o xnu0 -m state --state RELATED,ESTABLISHED -j ACCEPT
@@ -28,9 +30,21 @@ if command -v ethtool >/dev/null && ethtool -k "$up" 2>/dev/null | grep -q '^rx-
   sudo ethtool -K "$up" rx-gro-hw off && echo "vm-net-up: hardware GRO off on $up (its packets cannot be forwarded to xnu0)"
 fi
 command -v dnsmasq >/dev/null || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q dnsmasq-base >/dev/null 2>&1
+D=no
 if command -v dnsmasq >/dev/null; then
+  # pkill does not wait for the one it ended, which holds 192.168.77.1's ports a moment longer. A dnsmasq started in that
+  # moment fails ("Address already in use") and then there is none: every second start of the hosted system had no DHCP
+  # and no DNS. Waited for by process id, taken before the kill: a process that is ending has no command line to be
+  # found by any more while it still has its sockets.
+  OLD=$(pgrep -f 'dnsmasq.*xnu0' || true)
   sudo pkill -f 'dnsmasq.*xnu0' 2>/dev/null
-  sudo dnsmasq --interface=xnu0 --bind-interfaces --except-interface=lo --dhcp-range=192.168.77.2,192.168.77.50,12h \
+  for _ in $(seq 1 50); do
+    left=; for p in $OLD; do ! sudo kill -0 "$p" 2>/dev/null || left=1; done
+    [ -n "$left" ] || break; sleep 0.1
+  done
+  if sudo dnsmasq --interface=xnu0 --bind-interfaces --except-interface=lo --dhcp-range=192.168.77.2,192.168.77.50,12h \
     --dhcp-option=3,192.168.77.1 --dhcp-option=6,192.168.77.1 --pid-file=/run/dnsmasq-xnu0.pid
+  then D=yes; else D="DID NOT START (the hosted system gets no address and no DNS)"; fi
 fi
-echo "vm-net-up: xnu0 192.168.77.1/24 up, NAT via $up, dnsmasq: $(command -v dnsmasq >/dev/null && echo yes || echo no)"
+[ -n "$up" ] && N="via $up" || N="none (this host has no default route)"
+echo "vm-net-up: xnu0 192.168.77.1/24 up, NAT $N, dnsmasq: $D"

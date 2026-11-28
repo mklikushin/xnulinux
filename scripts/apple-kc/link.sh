@@ -17,7 +17,7 @@ POC=$(cd "$(dirname "$0")/../.." && pwd)
 abs() { python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$1"; }
 KIT=$(abs "$1"); OUT=$(abs "${3:-$KIT/kc-apple.bin}")
 INSTALL=; [ $# -lt 3 ] && [ -d /lib/firmware/xnu ] && INSTALL=/lib/firmware/xnu/kc-apple.bin
-W=${APPLE_KC_WORK:-$KIT/.work}; mkdir -p "$W"
+W=$(abs "${APPLE_KC_WORK:-$KIT/.work}"); mkdir -p "$W"	# absolute: kclink runs in the kit
 kit() { python3 -c 'import json,sys; v=json.load(open(sys.argv[1]))
 for k in sys.argv[2].split("."): v=v[k]
 print(" ".join(v) if isinstance(v, list) else v)' "$KIT/kit.json" "$1"; }
@@ -43,6 +43,6 @@ grep -E "^wrote" "$W/kclink.log" || true
 # AMFI of 27.2 expects platform version 27; the system disks the kit was made for carry 26 (scripts/kc-amfi-platform.py)
 python3 "$POC/scripts/kc-amfi-platform.py" "$OUT" "${AMFI_PLATFORM:-$(kit amfi_platform)}"
 if [ -n "$INSTALL" ]; then
-	sudo install -m 644 "$OUT" "$INSTALL" && OUT=$INSTALL
+	sudo install -m 644 "$OUT" "$INSTALL"; OUT=$INSTALL	# (not &&: a failed install must stop here, not go on to "boot it")
 fi
 echo "kernel collection with Apple's kexts: $OUT (boot it: IMAGE=xnu/$(basename "$OUT") scripts/xnulinux-boot.sh)"

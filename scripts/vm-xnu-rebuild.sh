@@ -1,8 +1,8 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0-only
-# Inside the VM: apply xnulinux's XNU patches to the k27 tree, rebuild the kernel incrementally, and (when the macOS 27.2
-# kernelcache is there) relink the kernel collection with Apple's kexts. The kernel's segment slots inside the collection
-# (k27/segaddrs.sh) follow the kernel's size: when kc27-layout.py moves them, the kernel is linked again.
+# Inside the VM: apply xnulinux's XNU patches to the k27 tree, rebuild the kernel incrementally, build xnulinux's kexts,
+# and (when the macOS 27.2 kernelcache is there) relink the kernel collection with Apple's kexts. The kernel's segment slots
+# inside the collection (k27/segaddrs.sh) follow the kernel's size: when kc27-layout.py moves them, the kernel is linked again.
 set -e -o pipefail	# a failed kernel build stops here: never repackage the previous kernel
 POC=${POC:-$(cd "$(dirname "$0")/.." && pwd)}	# this repository: its patches, kexts and linker
 cd ~/w/dvm
@@ -35,36 +35,44 @@ rm -rf $T/osfmk/corecrypto $T/osfmk/arm64/corecrypto
 mirror "$P"/corecrypto/include/corecrypto $T/EXTERNAL_HEADERS/corecrypto
 mirror "$P"/corecrypto/kernel $T/osfmk/xnulinux_crypto
 t=$SECONDS; JOBS=12 bash k27/build-kernel27.sh 2>&1 | tail -15; echo "kernel: $((SECONDS - t)) s"
-sudo mkdir -p /lib/firmware/xnu	# not there on a fresh host: the copies below would fail after the whole build
+sudo mkdir -p /lib/firmware/xnu	# where xnu.ko takes the kernel and the collection from: a new host has none
+cp k27/segaddrs.sh /tmp/segaddrs.before
 if [ -e out/kc/kc27.bin ]; then
-  cp k27/segaddrs.sh /tmp/segaddrs.before
   python3 k27/kc27-layout.py out/kc/kc27.bin out/k27/kernel-k27.macho --write k27/segaddrs.sh | tail -2
-  if ! cmp -s /tmp/segaddrs.before k27/segaddrs.sh; then
-    echo "kernel slots moved: linking the kernel again"
-    JOBS=12 bash k27/build-kernel27.sh 2>&1 | tail -3
-  fi
-  # xnulinux's own kexts (kexts/*/NAME.json + NAME.cpp), built against the k27 kernel's objects and linked into the collection
-  NATIVE=()
-  # IONetworkingFamily's kernel headers (IOKit/network/*.h) for XnuEthernet: Apple's open source IONetworkingFamily-188 (APSL,
-  # fetched here, not kept in the repository), whose __PRIVATE_SPI__ declarations name the reserved slots 2-5 the shipped family
-  # uses (the SDK's headers leave slot 5 a reserved stub the collection does not export)
-  NETINC="$POC/build/netinc"; NETSRC="$POC/build/IONetworkingFamily-188"; mkdir -p "$NETINC/IOKit"
-  [ -e "$NETSRC/IOEthernetController.h" ] || git clone -q --depth 1 --branch IONetworkingFamily-188 https://github.com/apple-oss-distributions/IONetworkingFamily.git "$NETSRC"
-  ln -sfn "$NETSRC" "$NETINC/IOKit/network"
-  # IOHIDFamily's kernel headers (IOKit/hid/*.h) for XnuInput and IOStorageFamily's (IOKit/storage/*.h) for XnuDisk: the SDK's
-  # Kernel.framework has them
-  for h in toolchains/sdks/*.sdk/System/Library/Frameworks/Kernel.framework/Headers/IOKit/hid; do
-    [ -e $h/IOHIDDevice.h ] && { ln -sfn $PWD/$h "$NETINC/IOKit/hid"; ln -sfn $PWD/$h/../hidsystem "$NETINC/IOKit/hidsystem"; ln -sfn $PWD/$h/../hidevent "$NETINC/IOKit/hidevent"; ln -sfn $PWD/$h/../graphics "$NETINC/IOKit/graphics"; ln -sfn $PWD/$h/../storage "$NETINC/IOKit/storage"
-      ln -sfn $PWD/${h%%/System/*}/usr/include/TargetConditionals.h "$NETINC/TargetConditionals.h"
-      ln -sfn $PWD/$h/../../HIDDriverKit "$NETINC/HIDDriverKit"; break; }	# IOHIDDevice.h includes HIDDriverKit/IOHIDDevice.h
-  done
-  for j in "$POC"/kexts/*/*.json; do
-    [ -e "$j" ] || continue
-    n=$(basename "$j" .json)
-    # a kext that does not build is left out of the collection (reported), not the whole rebuild
-    python3 scripts/build-native-kext.py $n "$(dirname "$j")/$n.cpp" -I "$NETINC" -I "$POC/kexts/include" --obj ${KEXT_OBJ:-k27-obj} || { echo "kext $n failed to build: left out"; continue; }
-    NATIVE+=("$j")
-  done
+elif [ -e "$POC"/scripts/free-kc/kernel-slots.py ]; then
+  # no kernelcache to lay the kernel's slots out by: the same slots from layout numbers (scripts/free-kc/layout.json).
+  # Without this the kernel kept macOS-DroidVM's committed slots, too small for it: __TEXT_EXEC was linked over __KLD
+  python3 "$POC"/scripts/free-kc/kernel-slots.py "$POC"/scripts/free-kc/layout.json out/k27/kernel-k27.macho --write k27/segaddrs.sh | tail -1
+fi
+if ! cmp -s /tmp/segaddrs.before k27/segaddrs.sh; then
+  echo "kernel slots moved: linking the kernel again"
+  JOBS=12 bash k27/build-kernel27.sh 2>&1 | tail -3
+fi
+# xnulinux's own kexts (kexts/*/NAME.json + NAME.cpp), built against the k27 kernel's objects. With or without Apple's
+# kernelcache: the collection without Apple's kexts (scripts/free-kc/build.sh) links XnuCPU, XnuDisk and XnuDrm too,
+# and compiles its kexts against build/netinc; with the kernelcache they are linked into the collection below
+NATIVE=()
+# IONetworkingFamily's kernel headers (IOKit/network/*.h) for XnuEthernet: Apple's open source IONetworkingFamily-188 (APSL,
+# fetched here, not kept in the repository), whose __PRIVATE_SPI__ declarations name the reserved slots 2-5 the shipped family
+# uses (the SDK's headers leave slot 5 a reserved stub the collection does not export)
+NETINC="$POC/build/netinc"; NETSRC="$POC/build/IONetworkingFamily-188"; mkdir -p "$NETINC/IOKit"
+[ -e "$NETSRC/IOEthernetController.h" ] || git clone -q --depth 1 --branch IONetworkingFamily-188 https://github.com/apple-oss-distributions/IONetworkingFamily.git "$NETSRC"
+ln -sfn "$NETSRC" "$NETINC/IOKit/network"
+# IOHIDFamily's kernel headers (IOKit/hid/*.h) for XnuInput and IOStorageFamily's (IOKit/storage/*.h) for XnuDisk: the SDK's
+# Kernel.framework has them
+for h in toolchains/sdks/*.sdk/System/Library/Frameworks/Kernel.framework/Headers/IOKit/hid; do
+  [ -e $h/IOHIDDevice.h ] && { ln -sfn $PWD/$h "$NETINC/IOKit/hid"; ln -sfn $PWD/$h/../hidsystem "$NETINC/IOKit/hidsystem"; ln -sfn $PWD/$h/../graphics "$NETINC/IOKit/graphics"; ln -sfn $PWD/$h/../storage "$NETINC/IOKit/storage"
+    ln -sfn $PWD/${h%%/System/*}/usr/include/TargetConditionals.h "$NETINC/TargetConditionals.h"
+    ln -sfn $PWD/$h/../../HIDDriverKit "$NETINC/HIDDriverKit"; break; }	# IOHIDDevice.h includes HIDDriverKit/IOHIDDevice.h
+done
+for j in "$POC"/kexts/*/*.json; do
+  [ -e "$j" ] || continue
+  n=$(basename "$j" .json)
+  # a kext that does not build is left out of the collection (reported), not the whole rebuild
+  python3 scripts/build-native-kext.py $n "$(dirname "$j")/$n.cpp" -I "$NETINC" -I "$POC/kexts/include" --obj ${KEXT_OBJ:-k27-obj} || { echo "kext $n failed to build: left out"; continue; }
+  NATIVE+=("$j")
+done
+if [ -e out/kc/kc27.bin ]; then
   printf '%s\n' "${NATIVE[@]}" > out/k27/natives.txt	# the kexts of ours in this collection, for scripts/apple-kc/package.sh
   # the collection (scripts/kclink): the kernel, xnulinux's kexts, and the Apple kexts of scripts/apple-kc/keep.txt from
   # macOS 27.2's kernelcache

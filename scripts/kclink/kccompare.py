@@ -3,7 +3,9 @@
 """Compares two kernel collections: their fixups (decoded), their fileset entries' segments and sections, the bytes of
 each entry's segments with pointers taken out, and their prelink info. For checking kclink against another linker.
 
-    kccompare.py A B"""
+    kccompare.py A B
+
+Its exit status is 1 when they differ."""
 import plistlib
 import struct
 import sys
@@ -30,13 +32,15 @@ def main():
     bufa, imga, hdra, fxa, ea, ia = A
     bufb, imgb, hdrb, fxb, eb, ib = B
     print(f'header {hdra:#x} / {hdrb:#x}; {len(fxa)} / {len(fxb)} pointers; {len(ea)} / {len(eb)} entries')
+    problems = 0                # everything said below is a difference and counts as one
     for sa, sb in zip(imga.segments, imgb.segments):
         if (sa.name, sa.vmaddr, sa.vmsize) != (sb.name, sb.vmaddr, sb.vmsize):
             print(f'  segment {sa.name} {sa.vmaddr:#x}+{sa.vmsize:#x} / {sb.name} {sb.vmaddr:#x}+{sb.vmsize:#x}')
+            problems += 1
     only = set(ea) ^ set(eb)
     if only:
         print('  entries in one only:', sorted(only))
-    problems = 0
+        problems += len(only)
     for name in sorted(set(ea) & set(eb)):
         xa, xb = ea[name], eb[name]
         segs_a = [(s.name, s.vmaddr, s.vmsize) for s in xa.segments if s.name != '__LINKEDIT']
@@ -79,6 +83,7 @@ def main():
     db = {d['CFBundleIdentifier']: d for d in ib['_PrelinkInfoDictionary']}
     if set(da) != set(db):
         print('prelink info: entries in one only:', sorted(set(da) ^ set(db)))
+        problems += len(set(da) ^ set(db))
     for k in sorted(set(da) & set(db)):
         if da[k] != db[k]:
             keys = sorted(x for x in set(da[k]) | set(db[k]) if da[k].get(x) != db[k].get(x))
@@ -87,8 +92,10 @@ def main():
     if {x: y for x, y in ia.items() if x != '_PrelinkInfoDictionary'} != \
             {x: y for x, y in ib.items() if x != '_PrelinkInfoDictionary'}:
         print('prelink info: top-level keys differ')
+        problems += 1
     print(f'{problems} differences')
+    return problems
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(1 if main() else 0)

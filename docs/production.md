@@ -37,7 +37,7 @@ What the PoC did to get each step running, and what replaces it. Ordered by what
 | ~30 scripts; the boot runs from `xnulinux-boot.sh` (builds, checks, retries, GPU bridge; the bisecting `vm-m2-kbisect.sh` is gone); several have fixed `sleep`s and host-specific defaults | One driver (`xnulinux` CLI): `build`, `disk`, `boot`, `console`, `screenshot`, `test`; configuration in one file |
 | HFS+ route scripts (`mk-fulldisk.sh`, `vm-sysdisk-*`, `vm-mk-sysdisk.sh`, `vm-m2-*`, `run-poc.sh`) | Removed (done: APFS route only) |
 | `tools/hosted/tests/t*.sh`, `af*.sh`: one-off probes (removed) | A test suite with expected results: boot to desktop, Safari/Chrome page load (screenshot compare), `xcodebuild` of a pinned project, Metal unit tests |
-| Done: CI (`.github/workflows/modules.yml`) builds fki.ko and xnu.ko on arm64 Ubuntu against the newest generic kernel headers and checks every source file for an SPDX line | Also: XNU + collection build (x86_64 Linux works with the DroidVM toolchain), GPU plugin host tests on macOS |
+| Done: CI (`.github/workflows/modules.yml`) builds fki.ko and xnu.ko on arm64 Ubuntu against the newest generic kernel headers and checks every source file for an SPDX line; `xnu-ko-loader.yml` runs xnu.ko's loader in user space under AddressSanitizer on images the test makes (`xnu-ko/test/run.sh`) | Also: XNU + collection build (x86_64 Linux works with the DroidVM toolchain), GPU plugin host tests on macOS |
 
 ## 5. GPU
 

@@ -10,6 +10,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
+#include <time.h>
 #include <unistd.h>
 #include <drm/drm.h>
 #include <drm/virtgpu_drm.h>
@@ -52,9 +54,21 @@ static struct virgl_renderer_callbacks cbs = {
 
 int vg_init(void)
 {
-	int r = virgl_renderer_init(&cbs, VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER | VIRGL_RENDERER_NO_VIRGL, &cbs);
+	const rlim_t want = VG_RES + 2 * VG_CLIENTS + 64;
+	struct rlimit rl;
 	uint32_t ver = 0, size = 0;
+	int r;
 
+	/*
+	 * Every resource is a descriptor here (its memory's) and every client two, and a service starts with 1024 of them.
+	 * Before the render server starts: its processes get the same, and there a Vulkan driver takes what it takes for
+	 * each allocation (lavapipe: three descriptors).
+	 */
+	if (!getrlimit(RLIMIT_NOFILE, &rl) && rl.rlim_cur < want) {
+		rl.rlim_cur = rl.rlim_max < want ? rl.rlim_max : want;
+		setrlimit(RLIMIT_NOFILE, &rl);
+	}
+	r = virgl_renderer_init(&cbs, VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER | VIRGL_RENDERER_NO_VIRGL, &cbs);
 	if (r) { fprintf(stderr, "xnudrmd: virgl_renderer_init: %d\n", r); return -1; }
 	virgl_renderer_get_cap_set(CAPSET_VENUS, &ver, &size);
 	if (!size) { fprintf(stderr, "xnudrmd: virglrenderer has no Venus capset\n"); return -1; }
@@ -239,17 +253,24 @@ static int do_map(uint32_t c, struct xnudrm_hdr *h, uint8_t *out, uint32_t *outl
 	return 0;
 }
 
+static uint64_t now_ns(void)
+{
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return t.tv_sec * 1000000000ull + t.tv_nsec;
+}
+
 /* No fence descriptor without the renderer's fence thread: poll. */
 static int fence_wait(uint32_t c, struct fence *f, uint64_t ns)
 {
-	int us = ns / 1000 > 50000 ? 50000 : (int)(ns / 1000);	/* at most 50 ms per host call */
+	/* at most 50 ms per host call, by the clock: a usleep(100) takes half as long again */
+	uint64_t end = now_ns() + (ns > 50000000 ? 50000000 : ns);
 
 	for (;;) {
 		virgl_renderer_context_poll(c);
 		if (f->state == 2) return 0;
-		if (us <= 0) return -XNUDRM_ETIME;
+		if (now_ns() >= end) return -XNUDRM_ETIME;
 		usleep(100);
-		us -= 100;
 	}
 }
 

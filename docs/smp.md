@@ -65,7 +65,7 @@ spinning lets the host take the spinning CPU's interrupts (`linux64_spin_relax`,
    Done: `hw.ncpu` and `hw.activecpu` 2; two `yes` plus the login's own work reach about 170% (more than one CPU can);
    the desktop comes up; minutes of running with a hundred cross-CPU fault resumes and no fault. Kernel fault counts
    are of one CPU's order (7.6 and 5.6 million in the first 8 minutes).
-3. N CPUs (`cpus=` defaults to the Linux CPUs less one for Linux), then the workloads: build a project, 4K playback.
+3. N CPUs (`cpus=`; its default is still 1, see Open), then the workloads: build a project, 4K playback.
    Done for `cpus=` up to 6 (2026-11-22): 1, 2, 4 and 6 CPUs each boot to the desktop (Dock 48, 42, 38, 39 s from
    `kern.boottime`) with no panic, silent CPU or soft lockup. What 3 and more needed:
    - fki's kick: one csd per target CPU shared by every sender; `smp_call_function_single_async`'s busy check is not

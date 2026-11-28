@@ -37,8 +37,11 @@ void
 xc_random(void *buf, size_t n)
 {
 	host_calls++;
-	if (getrandom(buf, n, 0) != (ssize_t)n) {
-		abort();
+	for (size_t k; n; buf = (uint8_t *)buf + k, n -= k) {	/* getentropy: Linux's and macOS's alike, 256 bytes a call */
+		k = n < 256 ? n : 256;
+		if (getentropy(buf, k) != 0) {
+			abort();
+		}
 	}
 }
 

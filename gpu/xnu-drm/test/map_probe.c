@@ -18,6 +18,8 @@
 #include "xf86drm.h"
 int xnudrm_open(const char *path, int flags, ...);
 void *xnudrm_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off);
+#undef os_dupfd_cloexec	/* xnudrm_compat.h names libxnudrm's; libxnudrm itself calls Mesa's (src/util/os_file.c), not linked here */
+int os_dupfd_cloexec(int fd) { return fcntl(fd, F_DUPFD_CLOEXEC, 3); }
 static sigjmp_buf jb;
 static void h(int s, siginfo_t *si, void *u) { printf("  signal %d code %d addr %p\n", s, si->si_code, si->si_addr); siglongjmp(jb, 1); }
 #define TRY(name, stmt) do { if (!sigsetjmp(jb, 1)) { stmt; printf("ok   %s\n", name); } else printf("FAIL %s\n", name); fflush(stdout); } while (0)

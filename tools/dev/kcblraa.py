@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-# In [lo, hi) of a fileset KC: "ldr xA, [xB, #off]" followed within 4 instructions by "mov x17, #imm" and
-# "blraa xA, x17" (a call through a type-discriminated function pointer field). Prints off, imm, base reg, address.
+# In [lo, hi) of a fileset KC: "ldr xA, [xB, #off]" followed within 13 instructions by "mov x17, #imm" and
+# "blraa xA, x17" (a call through a type-discriminated function pointer field), xA not loaded again in between.
+# Prints off, imm, base reg, address.
 import struct, sys, collections
 path, lo, hi = sys.argv[1], int(sys.argv[2], 16), int(sys.argv[3], 16)
 d = open(path, 'rb').read()
@@ -20,6 +21,8 @@ for _ in range(ncmds):
                     imm = None
                     for j in range(i + 1, min(i + 14, len(words))):
                         x = words[j]
+                        if (x & 0xffc0001f) == 0xf9400000 | rt:     # xA loaded again: the call is through that load, not this one
+                            break
                         if (x & 0xffe0001f) == 0xd2800011:  # movz x17, #imm16
                             imm = (x >> 5) & 0xffff
                         if (x & 0xfffffc1f) == (0xd73f0800 | 0) and ((x >> 5) & 31) == rt and imm is not None:

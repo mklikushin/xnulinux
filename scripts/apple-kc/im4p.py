@@ -5,10 +5,17 @@
     im4p.py INPUT OUTPUT [MEMBER]
 
 INPUT is an IPSW (a zip: MEMBER, default kernelcache.release.vma2, is read from it), an IPSW's URL (Apple's own:
-only the member is downloaded, with HTTP range requests), an IM4P, or an unpacked Mach-O (copied). An IM4P is DER: SEQUENCE { "IM4P", type, description, OCTET STRING payload, ... }; the payload is LZFSE
-("bvx2...", decoded by the lzfse tool: apt install lzfse), LZSS ("complzss" with Apple's 0x180-byte header), or plain.
+only the member is downloaded, with HTTP range requests), an IM4P, an IMG4 with the IM4P in it (the kernelcache file of
+an installed macOS, on its Preboot volume), or an unpacked Mach-O (copied). An IM4P is DER: SEQUENCE { "IM4P", type,
+description, OCTET STRING payload, ... }; the payload is LZFSE ("bvx2...", decoded by the lzfse tool: apt install
+lzfse), LZSS ("complzss" with Apple's 0x180-byte header), or plain.
+
+A file that is cut short or does not unpack to what it says is refused, and OUTPUT is not written: the DER lengths
+must fit the file, the unpacked size must be the one the IM4P (LZFSE) or the LZSS header states, and the result must
+be a Mach-O.
 """
 import http.client
+import os
 import shutil
 import struct
 import subprocess
@@ -17,6 +24,9 @@ import tempfile
 import time
 import urllib.request
 import zipfile
+
+
+MACHO = b'\xcf\xfa\xed\xfe'
 
 
 class Remote:
@@ -81,28 +91,49 @@ class Remote:
 
 
 def der(data, at):
-    """(tag, start of contents, end of contents) of the DER element at `at`."""
+    """(tag, start of contents, end of contents) of the DER element at `at`. Its contents must be there: a file
+    that was cut short (a download that stopped) ends before one of its elements does."""
+    if at + 2 > len(data):
+        raise SystemExit(f'cut short: {len(data)} bytes, and a DER element starts at {at}')
     tag, n = data[at], data[at + 1]
     at += 2
     if n & 0x80:
         k = n & 0x7f
         n = int.from_bytes(data[at:at + k], 'big')
         at += k
+    if at + n > len(data):
+        raise SystemExit(f'cut short: {len(data)} bytes, and a DER element of it ends at {at + n}')
     return tag, at, at + n
 
 
-def payload(data):
-    tag, at, end = der(data, 0)
-    if tag != 0x30:
-        raise SystemExit('not an IM4P (no DER SEQUENCE)')
+def elements(data, at, end):
+    """The DER elements in data[at:end], as der() gives them."""
     items = []
     while at < end:
         t, s, e = der(data, at)
         items.append((t, s, e))
         at = e
+    return items
+
+
+def payload(data):
+    """(payload, its unpacked size or None) of an IM4P, or of the IM4P in an IMG4 (SEQUENCE { "IMG4", IM4P, manifest }).
+    The size is the IM4P's compression record, SEQUENCE { INTEGER algorithm, INTEGER unpacked size }, where it has one
+    (Apple's LZFSE kernelcaches do)."""
+    tag, at, end = der(data, 0)
+    if tag != 0x30:
+        raise SystemExit('not an IM4P (no DER SEQUENCE)')
+    items = elements(data, at, end)
+    if len(items) > 1 and data[items[0][1]:items[0][2]] == b'IMG4' and items[1][0] == 0x30:
+        items = elements(data, items[1][1], items[1][2])
     if len(items) < 4 or data[items[0][1]:items[0][2]] != b'IM4P' or items[3][0] != 0x04:
         raise SystemExit('not an IM4P')
-    return data[items[3][1]:items[3][2]]
+    size = None
+    for t, s, e in items[4:]:
+        sub = elements(data, s, e) if t == 0x30 else []
+        if len(sub) == 2 and sub[0][0] == sub[1][0] == 0x02:
+            size = int.from_bytes(data[sub[1][1]:sub[1][2]], 'big')
+    return data[items[3][1]:items[3][2]], size
 
 
 def lzss(src, size):
@@ -151,25 +182,39 @@ def main():
             data = z.read(member)
     else:
         data = open(src, 'rb').read()
-    if data[:4] == b'\xcf\xfa\xed\xfe':
+    if data[:4] == MACHO:
         open(dst, 'wb').write(data)
         return
-    body = payload(data)
+    body, size = payload(data)
     if body[:4] == b'bvx2':
         lz = shutil.which('lzfse')
         if not lz:
             raise SystemExit('the kernelcache is LZFSE-compressed: install lzfse (apt install lzfse)')
-        with tempfile.NamedTemporaryFile() as f:
+        # beside OUTPUT, moved there once it is known to be whole
+        with tempfile.NamedTemporaryFile() as f, tempfile.TemporaryDirectory(dir=os.path.dirname(os.path.abspath(dst))) as d:
             f.write(body)
             f.flush()
-            subprocess.run([lz, '-decode', '-i', f.name, '-o', dst], check=True)
-    elif body[:8] == b'complzss':
+            out = os.path.join(d, 'kernelcache')
+            if subprocess.run([lz, '-decode', '-i', f.name, '-o', out]).returncode != 0 or not os.path.exists(out):
+                raise SystemExit(f'{src}: lzfse could not decode the payload (damaged?)')
+            have = os.path.getsize(out)
+            if size is not None and have != size:
+                raise SystemExit(f'{src}: the payload unpacks to {have} bytes, the IM4P says {size} (damaged?)')
+            if open(out, 'rb').read(4) != MACHO:
+                raise SystemExit(f'{src}: the payload does not unpack to a Mach-O (damaged?)')
+            os.replace(out, dst)
+        return
+    if body[:8] == b'complzss':
+        if len(body) < 0x180:
+            raise SystemExit(f'{src}: cut short (an LZSS payload of {len(body)} bytes, less than its header)')
         size, = struct.unpack('>I', body[12:16])
-        open(dst, 'wb').write(lzss(body[0x180:], size))
-    elif body[:4] == b'\xcf\xfa\xed\xfe':
-        open(dst, 'wb').write(body)
-    else:
-        raise SystemExit(f'unknown IM4P payload ({body[:8]!r})')
+        body = lzss(body[0x180:], size)
+        if len(body) != size:
+            raise SystemExit(f'{src}: the payload unpacks to {len(body)} bytes, its LZSS header says {size} (cut short?)')
+    if body[:4] != MACHO:
+        raise SystemExit(f'{src}: the IM4P payload is not a kernelcache ({body[:8]!r})')
+    open(dst, 'wb').write(body)
 
 
-main()
+if __name__ == '__main__':
+    main()

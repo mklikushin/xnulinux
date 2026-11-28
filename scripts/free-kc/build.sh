@@ -4,8 +4,8 @@
 # own kexts (XnuCPU, XnuDisk, XnuDrm), plus the kexts a Darwin userland needs, built from PureDarwin's sources as arm64e with
 # this kernel's own compile flags and headers (scripts/free-kc/kcc.py): a permissive AMFI, pthread, IOStorageFamily,
 # HFSEncodings and hfs; and xnulinux's own corecrypto kext (kexts/free/corecrypto: Mbed TLS behind the kernel's corecrypto
-# interface). It boots PureDarwin's userland from an HFS+ disk (scripts/mk-puredarwin-disk.sh):
-#   IMAGE=xnu/kc-free.bin DISK=... ROOT_UUID=... scripts/xnulinux-boot.sh
+# interface). It boots PureDarwin's userland from an HFS+ disk (scripts/mk-puredarwin-disk.sh, which prints its pd.conf):
+#   MAC_CONF=pd.conf DISK=pd.img IMAGE=xnu/kc-free.bin TRUSTCACHE= GPU=off scripts/xnulinux-boot.sh
 # Sources are fetched at pinned revisions (Mbed TLS: kexts/free/corecrypto/mbedtls.rev).
 #
 # Nothing of Apple's is read: the collection is linked into an empty one that mk-template.py makes from layout numbers
@@ -13,6 +13,7 @@
 set -euo pipefail
 POC=$(cd "$(dirname "$0")/../.." && pwd)
 DVM=${DVM:-$HOME/w/dvm}; W=${FREE_KC_WORK:-$HOME/w/free-kc}; OUT=${OUT:-/lib/firmware/xnu/kc-free.bin}
+mkdir -p $W; W=$(cd $W && pwd); DVM=$(cd $DVM && pwd)	# every step below runs in another directory: no relative names
 PD_URL=https://github.com/AFK-surf/PureDarwin PD_REV=b3b4b2812fdd1c5c251dc3089b5a1a9e00d29970
 MBEDTLS_URL=https://github.com/Mbed-TLS/mbedtls MBEDTLS_REV=$(sed -n 's/^MBEDTLS_REV=//p' $POC/kexts/free/corecrypto/mbedtls.rev)
 export DVM NETINC=${NETINC:-$POC/build/netinc}

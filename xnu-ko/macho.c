@@ -184,12 +184,21 @@ int macho_rebase(struct xnu_image *img)
 	}
 	if (!img->thread_starts || !mh_vm)
 		return -ENOEXEC;
-	u32_t *ts = (u32_t *)(img->thread_starts + img->slide);
-	u32_t *te = (u32_t *)((char *)ts + img->thread_starts_size);
+	/*
+	 * The section and every fixup inside the loaded image: the section header's address and the offsets in its list
+	 * were followed wherever they pointed, read and written here with XNU's keys loaded and interrupts off.
+	 */
+	u64_t ts_va, lo = img->vmlow + img->slide, hi = img->vmhigh + img->slide;
+	if (img->thread_starts_size < 4 || !macho_va_to_loaded(img, img->thread_starts, img->thread_starts_size, &ts_va))
+		return -ENOEXEC;
+	u32_t *ts = (u32_t *)ts_va;
+	u32_t *te = ts + img->thread_starts_size / 4;
 	u64_t step = (ts[0] & 1) ? 8 : 4, n = 0;
 	for (u32_t *o = ts + 1; o < te && *o != 0xffffffff; o++) {
 		u64_t addr = mh_vm + img->slide + *o, delta;
 		do {
+			if (addr < lo || addr > hi - 8)
+				return -ENOEXEC;
 			u64_t v = *(u64_t *)addr;
 			if (!(v & (1ULL << 62))) {
 				if (v & (1ULL << 63)) {
@@ -259,16 +268,25 @@ int macho_slide_header(struct xnu_image *img, u64_t *mh_unslid)
 		    ((const struct seg64 *)l)->fileoff == 0)
 			mh_vm = ((const struct seg64 *)l)->vmaddr;
 	}
-	if (!mh_vm)
+	u64_t mh_va;
+	if (!mh_vm || !macho_va_to_loaded(img, mh_vm, sizeof(struct mh64), &mh_va))
 		return -ENOEXEC;
 	*mh_unslid = mh_vm;
-	unsigned char *mh = (unsigned char *)(mh_vm + img->slide);
+	unsigned char *mh = (unsigned char *)mh_va;
 	const struct mh64 *h = (const void *)mh;
+	/*
+	 * The commands as loaded, which are not the file's that macho_load checked when a segment lies over them or a
+	 * fixup was in them: they stay inside the image, and a segment's sections inside its command.
+	 */
+	if (h->sizeofcmds > img->vmhigh - mh_vm - sizeof(struct mh64))
+		return -ENOEXEC;
 	struct lc *l = (void *)(mh + sizeof(struct mh64)), *e = (void *)(mh + sizeof(struct mh64) + h->sizeofcmds);
 	int n = 0;
 	for (u32_t ci = 0; ci < h->ncmds && LC_OK(l, e); ci++, l = (void *)((char *)l + l->cmdsize)) {
 		if (l->cmd != LC_SEGMENT_64) continue;
 		struct seg64 *sg = (void *)l;
+		if (l->cmdsize < sizeof(struct seg64) || sg->nsects > (l->cmdsize - sizeof(struct seg64)) / sizeof(struct sect64))
+			return -ENOEXEC;
 		if (!sg->vmsize) continue;
 		sg->vmaddr += img->slide;
 		struct sect64 *sc = (void *)(sg + 1);

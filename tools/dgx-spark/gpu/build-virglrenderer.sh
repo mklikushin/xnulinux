@@ -7,8 +7,9 @@ V=1.2.0
 W=${W:-$HOME/w/virglrenderer}; mkdir -p "$W"; cd "$W"
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential meson ninja-build pkg-config libdrm-dev \
   libepoxy-dev libvulkan-dev libgbm-dev libegl-dev python3-yaml >/dev/null
-[ -f virglrenderer-$V.tar.gz ] || curl -sSLo virglrenderer-$V.tar.gz \
-  https://gitlab.freedesktop.org/virgl/virglrenderer/-/archive/$V/virglrenderer-$V.tar.gz
+# (under another name until it is whole: an error page or a transfer cut short is not the tarball of the next run)
+[ -f virglrenderer-$V.tar.gz ] || { curl -fsSLo virglrenderer-$V.tar.gz.part \
+  https://gitlab.freedesktop.org/virgl/virglrenderer/-/archive/$V/virglrenderer-$V.tar.gz; mv virglrenderer-$V.tar.gz.part virglrenderer-$V.tar.gz; }
 rm -rf src && mkdir src && tar -C src --strip-components=1 -xf virglrenderer-$V.tar.gz
 # A process for each context (the default), not a thread: NVIDIA's driver gives one process about 512 open device files,
 # a context with a device holds 10 to 75 of them, and past that vkCreateDevice fails (VK_ERROR_INITIALIZATION_FAILED):

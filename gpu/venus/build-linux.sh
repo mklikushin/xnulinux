@@ -6,12 +6,13 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 MESA=26.3.1
-W=${W:-$HOME/w/venus}; OUT=${OUT:-$W/out}; mkdir -p "$W"; cd "$W"
+W=${W:-$HOME/w/venus}; mkdir -p "$W"; cd "$W"; W=$PWD; OUT=${OUT:-$W/out}	# W absolute: PATH and meson's --prefix below
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ninja-build libdrm-dev glslang-tools bison flex pkg-config \
   libexpat1-dev zlib1g-dev libudev-dev libzstd-dev libvulkan-dev vulkan-tools python3-venv >/dev/null
 [ -x venv/bin/meson ] || { python3 -m venv venv && venv/bin/pip -q install meson mako pyyaml packaging; }
 export PATH=$W/venv/bin:$PATH
-[ -f mesa-$MESA.tar.xz ] || curl -sSLo mesa-$MESA.tar.xz https://archive.mesa3d.org/mesa-$MESA.tar.xz
+# (under another name until it is whole: an error page or a transfer cut short is not the tarball of the next run)
+[ -f mesa-$MESA.tar.xz ] || { curl -fsSLo mesa-$MESA.tar.xz.part https://archive.mesa3d.org/mesa-$MESA.tar.xz; mv mesa-$MESA.tar.xz.part mesa-$MESA.tar.xz; }
 rm -rf mesa && mkdir mesa && tar -C mesa --strip-components=1 -xf mesa-$MESA.tar.xz
 for p in "$HERE"/patches/*.patch; do patch -d mesa -p1 --no-backup-if-mismatch -s < "$p"; done
 meson setup mesa/build mesa --prefix="$OUT" --buildtype=release -Dvulkan-drivers=virtio -Dgallium-drivers= \

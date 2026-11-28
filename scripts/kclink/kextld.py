@@ -46,6 +46,7 @@ ZEROFILL = {'__bss', '__common'}
 # arm64 relocation types
 UNSIGNED, SUBTRACTOR, BRANCH26, PAGE21, PAGEOFF12, GOT_LOAD_PAGE21, GOT_LOAD_PAGEOFF12, POINTER_TO_GOT = range(8)
 ADDEND, AUTHENTICATED_POINTER = 10, 11
+CPU_SUBTYPE_ARM64E = 2
 
 # kmod_info_t (<mach/kmod.h>, 4-byte packed): next, info_version, id, name[64], version[64], reference_count,
 # reference_list, address, size, hdr_size, start, stop
@@ -76,8 +77,11 @@ class Obj:
         self.path = path
         self.buf = open(path, 'rb').read()
         self.img = Image(self.buf)
-        if self.img.filetype != MH_OBJECT or self.img.cputype != CPU_TYPE_ARM64:
-            raise LinkError(f'{path}: not an arm64 object')
+        # arm64e only (the subtype's low 24 bits; the rest is the pointer authentication ABI's version): an arm64 object
+        # signs none of its pointers, and the kext is an arm64e one whatever went into it
+        if (self.img.filetype != MH_OBJECT or self.img.cputype != CPU_TYPE_ARM64 or
+                self.img.cpusubtype & 0xffffff != CPU_SUBTYPE_ARM64E):
+            raise LinkError(f'{path}: not an arm64e object')
         self.sects = self.img.sections()       # input sections, 1-based in nlist n_sect
         self.syms = self.img.symbols()
         self.where = {}                         # input section index -> (OutSection, offset)
@@ -118,11 +122,13 @@ class Kext:
                 out.pieces.append((oi, si, off))
                 out.size, out.align = off + s.size, max(out.align, s.align)
                 o.where[si] = (out, off)
-        # common symbols: zero-filled storage in __DATA,__common
+        # common symbols: zero-filled storage in __DATA,__common (but for one an object defines: that is the symbol)
         common = {}
+        defined = {n for o in self.objs for n, t, sc, d, v in o.syms
+                   if not t & N_STAB and t & (N_EXT | N_PEXT) and (t & N_TYPE) == N_SECT}
         for o in self.objs:
             for n, t, sc, d, v in o.syms:
-                if not t & N_STAB and (t & N_TYPE) == N_UNDF and t & N_EXT and v:
+                if not t & N_STAB and (t & N_TYPE) == N_UNDF and t & N_EXT and v and n not in defined:
                     size, al = common.get(n, (0, 0))
                     common[n] = (max(size, v), max(al, (d >> 8) & 0xf))
         if common:
@@ -146,7 +152,9 @@ class Kext:
                         prev = self.globals[n]
                         raise LinkError(f'{n} defined twice (in {o.path} and at {prev[0].seg},{prev[0].name})')
                     weak.discard(n)                     # over a weak one
-                elif d & 0x80:
+                elif not d & 0x80:
+                    weak.discard(n)                     # (at the place of a weak one too: the two are one, not weak)
+                elif n not in self.globals:
                     weak.add(n)
                 self.globals[n] = where
         # a GOT entry for every symbol the code loads through one
@@ -273,7 +281,10 @@ class Kext:
                         target, name = None, None
                     if typ in (UNSIGNED, AUTHENTICATED_POINTER):
                         if length != 3:
-                            raise LinkError(f'{o.path}: {length * 8}-bit pointer at {s.sectname}+{raddr:#x}')
+                            raise LinkError(f'{o.path}: {8 << length}-bit pointer at {s.sectname}+{raddr:#x}')
+                        if place & 3:           # (a collection's chained fixups are at multiples of 4)
+                            raise LinkError(f'{o.path}: pointer at {s.sectname}+{raddr:#x} not at a multiple of 4 '
+                                            f'bytes ({place:#x})')
                         raw = struct.unpack_from('<Q', out.data, pos)[0]
                         if typ == AUTHENTICATED_POINTER:
                             add = raw & 0xffffffff

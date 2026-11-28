@@ -10,13 +10,15 @@ alignment (VIRTIO_GPU_F_BLOB_ALIGNMENT); until Mesa reads it, align everything t
 
 --- a/src/virtio/vulkan/vn_device_memory.c
 +++ b/src/virtio/vulkan/vn_device_memory.c
-@@ -31,6 +31,10 @@ vn_device_memory_alloc_simple(struct vn_device *dev,
+@@ -31,6 +31,12 @@ vn_device_memory_alloc_simple(struct vn_device *dev,
  {
     VkDevice dev_handle = vn_device_to_handle(dev);
     VkDeviceMemory mem_handle = vn_device_memory_to_handle(mem);
 +
-+   ((VkMemoryAllocateInfo *)alloc_info)->allocationSize =
-+      align64(alloc_info->allocationSize, 16384);
++   /* in a copy: the info is the application's own, const and possibly in read-only memory */
++   VkMemoryAllocateInfo aligned_info = *alloc_info;
++   aligned_info.allocationSize = align64(alloc_info->allocationSize, 16384);
++   alloc_info = &aligned_info;
 +
     if (VN_PERF(NO_ASYNC_MEM_ALLOC)) {
        return vn_call_vkAllocateMemory(dev->primary_ring, dev_handle,

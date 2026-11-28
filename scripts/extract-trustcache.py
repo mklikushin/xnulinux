@@ -6,7 +6,7 @@
 
 Run on the Mac whose OS the hosted system disk was made from, or give the mounted Preboot volume of that disk (an
 installed macOS VM disk, scripts/mk-macvm-disk.sh). The output is Apple data: it stays local (the VM's
-/lib/firmware/xnu/trustcache.bin, passed to xnu.ko as trustcache=), never in the repository.
+/lib/firmware/xnu/trustcache-mac.bin, xnulinux-boot.sh's TRUSTCACHE, passed to xnu.ko as trustcache=), never in the repository.
 """
 import glob, struct, sys
 

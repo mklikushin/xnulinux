@@ -3,28 +3,35 @@
 # On the macOS host: the hosted system's disk from a macOS VM disk installed by Apple's own installer, then sent to
 # the xnupoc VM as /var/tmp/mac.img (xnu.ko disk=, kexts/XnuDisk; boot-arg rd=<its system volume>).
 #
-# `tart create NAME --from-ipsw latest` installs macOS with Virtualization.framework, as Apple's own VMs are installed: the
+# `tart create xnumac --from-ipsw latest` installs macOS with Virtualization.framework, as Apple's own VMs are installed: the
 # whole Apple Silicon layout (iBootSystemContainer with xART and Hardware, the main container with the System and Data
 # volume group and Preboot with the cryptexes, the Recovery container). The sealed System volume stays as installed; what the
 # hosted system needs is added to the Data volume only:
 #  - the local user, automatic login, Setup Assistant done (tools/hosted/gui-user.py)
-#  - the CPU Metal plugin in /Library/GPUBundles (the GPU line's dist/XnuCpuMetal.bundle)
+#  - the CPU Metal plugin in /Library/GPUBundles (the GPU line's dist/XnuCpuMetal.bundle), if it was built: without
+#    it the hosted system has no Metal device at all (the bundle is the metal2vulkan/lavapipe CPU rendering path)
 #  - a root shell on /dev/console (xnulinux.shell), the hosted system's console
 #  - launchd's disabled list for daemons of hardware the hosted system has not (watchdog, audio, ...) and Rosetta's
 # and the static trust cache of that macOS build, for xnu.ko trustcache=. Apple's files stay on this host and in the VM.
+# SRC: the installed disk (default ~/.tart/vms/xnumac/disk.img: a VM of another NAME needs SRC=~/.tart/vms/NAME/disk.img).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 V="bash scripts/vm.sh"
 SRC=${SRC:-$HOME/.tart/vms/xnumac/disk.img}; W=${W:-$PWD/../macvm}; IMG=$W/mac.img
+# GPU is this host's own setting: an explicitly given path that does not hold a bundle is a mistake, not "build
+# without one" (that is what leaving GPU unset is for).
+if [ -n "${GPU-}" ] && [ ! -d "$GPU" ]; then echo "GPU=$GPU: no such bundle" >&2; exit 1; fi
 GPU=${GPU:-$PWD/gpu/xnu-cpu-metal/dist/XnuCpuMetal.bundle}
 # bluetoothd: no Bluetooth controller; it fails to boot the chip and exits, and launchd starts it again every few seconds
 DISABLE="com.apple.watchdogd com.apple.iomfb_bics_daemon com.apple.audiomxd com.apple.audio.coreaudiod com.apple.PerfPowerServices
  com.apple.PerfPowerServicesExtended com.apple.oahd com.apple.oahd-root-helper com.apple.bluetoothd ${DISABLE:-}"
-# images of ours left attached by an earlier run
+# images of ours left attached by an earlier run: a clone (mac.img), and the installed disk, which is $SRC and not
+# whatever is called disk.img (every tart VM's disk is: one attached for something else is not ours to detach)
 for d in $(hdiutil info -plist | python3 -c 'import plistlib,sys,os
 for i in plistlib.loads(sys.stdin.buffer.read()).get("images", []):
-    if os.path.basename(i.get("image-path", "")) in ("disk.img", "mac.img"):
-        print(*[e["dev-entry"] for e in i.get("system-entities", []) if "content-hint" in e and e["content-hint"] == "GUID_partition_scheme"])'); do
+    p = i.get("image-path", "")
+    if os.path.basename(p) == "mac.img" or os.path.realpath(p) == os.path.realpath(sys.argv[1]):
+        print(*[e["dev-entry"] for e in i.get("system-entities", []) if "content-hint" in e and e["content-hint"] == "GUID_partition_scheme"])' "$SRC"); do
   hdiutil detach "$d" -force >/dev/null 2>&1 || true
 done
 mkdir -p "$W"; rm -f "$IMG"; cp -c "$SRC" "$IMG"	# an APFS clone of the installed disk: the installed one stays pristine
@@ -52,8 +59,15 @@ echo "keybags: $(sudo -n ls "$D/private/var/keybags" 2>/dev/null | tr '\n' ' ')"
 sudo -n rm -f "$D"/private/var/keybags/*
 sudo -n python3 tools/hosted/gui-user.py "$D" "$W/sys/System/Library/User Template"
 sudo -n mkdir -p "$D/Library/GPUBundles" "$D/Library/LaunchDaemons" "$D/private/var/db/com.apple.xpc.launchd"
-sudo -n rm -rf "$D/Library/GPUBundles/XnuCpuMetal.bundle"; sudo -n ditto "$GPU" "$D/Library/GPUBundles/XnuCpuMetal.bundle"
-sudo -n chown -R root:wheel "$D/Library/GPUBundles"
+# The disk is a clone of a configurable SRC, which may already carry a bundle: clear it either way, so the disk has
+# exactly the bundle this run was told about.
+sudo -n rm -rf "$D/Library/GPUBundles/XnuCpuMetal.bundle"
+if [ -d "$GPU" ]; then
+  sudo -n ditto "$GPU" "$D/Library/GPUBundles/XnuCpuMetal.bundle"
+  sudo -n chown -R root:wheel "$D/Library/GPUBundles"
+else
+  echo "no GPU bundle at $GPU: the hosted system runs without a Metal device"
+fi
 # Third-party applications for the hosted system (e.g. Google Chrome, fetched from its vendor on this host; never in the
 # repo): every *.app in $APPS goes to /Applications on the Data volume.
 for a in "${APPS:-$W/../apps}"/*.app; do

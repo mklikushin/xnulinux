@@ -81,6 +81,7 @@ static void load_instance(VkInstance inst) {
 #define CK(x) do{VkResult r=(x); if(r){printf("FAIL %s = %d\n",#x,r); exit(1);}}while(0)
 int main(int argc,char**argv){
   const uint32_t N=1u<<22; /* 4M uints = 16 MB */
+  if(argc<2){ printf("usage: %s compute.spv   (glslangValidator -V compute.comp -o compute.spv; VT_ICD=driver, VT_DEVICE=n)\n",argv[0]); return 2; }
   VkInstance inst; VkApplicationInfo ai={VK_STRUCTURE_TYPE_APPLICATION_INFO,0,"vt",1,0,0,VK_API_VERSION_1_1};
   VkInstanceCreateInfo ic={VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,0,0,&ai};
   load_global();
@@ -106,7 +107,7 @@ int main(int argc,char**argv){
   VkMemoryAllocateInfo ma={VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,0,mr.size,mt}; VkDeviceMemory mem; CK(vkAllocateMemory(dev,&ma,0,&mem));
   CK(vkBindBufferMemory(dev,buf,mem,0)); uint32_t*p; CK(vkMapMemory(dev,mem,0,N*4,0,(void**)&p));
   for(uint32_t i=0;i<N;i++) p[i]=i;
-  FILE*f=fopen(argv[1],"rb"); fseek(f,0,2); long sz=ftell(f); rewind(f); uint32_t*code=malloc(sz); if(fread(code,1,sz,f)!=(size_t)sz){printf("short read\n");return 1;} fclose(f);
+  FILE*f=fopen(argv[1],"rb"); if(!f){ perror(argv[1]); return 1; } fseek(f,0,2); long sz=ftell(f); rewind(f); uint32_t*code=malloc(sz); if(fread(code,1,sz,f)!=(size_t)sz){printf("short read\n");return 1;} fclose(f);
   VkShaderModuleCreateInfo sc={VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,0,0,sz,code}; VkShaderModule sm; CK(vkCreateShaderModule(dev,&sc,0,&sm));
   VkDescriptorSetLayoutBinding lb={0,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT};
   VkDescriptorSetLayoutCreateInfo lc={VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,0,0,1,&lb}; VkDescriptorSetLayout dl; CK(vkCreateDescriptorSetLayout(dev,&lc,0,&dl));
@@ -120,7 +121,7 @@ int main(int argc,char**argv){
   VkCommandBufferAllocateInfo cba={VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,0,cp,0,1}; VkCommandBuffer cb; CK(vkAllocateCommandBuffers(dev,&cba,&cb));
   VkCommandBufferBeginInfo bi={VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; CK(vkBeginCommandBuffer(cb,&bi));
   vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,pipe); vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,pl,0,1,&ds,0,0);
-  vkCmdDispatch(cb,N/64,1,1);
+  vkCmdDispatch(cb,1024,N/65536,1);	/* 1024 x 64 groups of 64 (compute.comp): N/64 in one row is 65536, and 65535 is all a device has to take (lavapipe's limit) */
   VkMemoryBarrier mb={VK_STRUCTURE_TYPE_MEMORY_BARRIER,0,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_HOST_READ_BIT};
   vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&mb,0,0,0,0);
   CK(vkEndCommandBuffer(cb));

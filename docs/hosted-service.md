@@ -27,13 +27,14 @@ artifact comes with its source.
 |---|---|---|---|
 | `fki.ko` | `fki-ko/` | GPL-2.0-only | the foreign kernel interface: CPUs, memory carve-out, faults, IPIs, host calls |
 | `xnu.ko` | `xnu-ko/` | APSL-2.0 | loads and runs the kernel collection. It is a non-GPL module that taints the kernel, like ZFS: ship its **source** and build it on the host against the running kernel (`xnulinux-boot.sh` does this on every boot, and a DKMS package would do it on kernel updates). Do not ship it prebuilt inside a kernel package |
-| `xnudrmd` | `gpu/xnu-drm/xnudrmd.c` | GPL-2.0-only | the GPU bridge's Linux service (virtio-gpu Venus render nodes only so far) |
+| `xnudrmd` | `gpu/xnu-drm/xnudrmd.c` | GPL-2.0-only | the GPU bridge's Linux service (a virtio-gpu Venus render node, or another through virglrenderer: `xnudrmd_virgl.c`) |
 | boot and service scripts | `scripts/xnulinux-boot.sh`, `install-service.sh`, `vm-install-fki-service.sh`, `vm-net-up.sh` | GPL-2.0-only | `xnulinux.service`, `xnulinux-fki.service`, `/etc/xnulinux.conf` |
 | kernel command line | `vm-install-fki-service.sh` | | `mem=`, `nokaslr`, `log_buf_len=`; the carve-out (`carve_base`, `carve_mb`) sized for each host model |
 | on Mac hosts | `scripts/krun-vm.sh`, `install-krun-agent.sh`, krunkit (Apache-2.0) | | the Linux VM with virtio-gpu Venus; a launchd agent keeps it running |
 
 The host Linux is a stock arm64 distribution kernel (Ubuntu 24.04 is tested) with 4K pages. The CPU needs PAC
-(`FEAT_PAuth`), and Linux must run at EL1, not as a bare-metal VHE kernel at EL2. `fki.ko` refuses to load otherwise.
+(`FEAT_PAuth`), and Linux must run at EL1, not as a bare-metal VHE kernel at EL2 (`kvm-arm.mode=nvhe` on a DGX Spark).
+`fki.ko` refuses to load otherwise.
 
 ### 2.2 The kernel kit
 
@@ -45,7 +46,7 @@ The host Linux is a stock arm64 distribution kernel (Ubuntu 24.04 is tested) wit
 | `kexts/NAME/` | our kexts as arm64e objects plus the description `kclink` links them from (`XnuCPU`, `XnuDisk`, `XnuDrm`, display, input, ethernet...) |
 | `kc-free.bin` | the PureDarwin kernel collection (`scripts/free-kc/build.sh`). It is the same byte for byte whether or not any Apple kernelcache is visible to the build. |
 | `kit.json` | for `link.sh`: the sha256 of the one kernelcache it links against and Apple's IPSW URL for it, the Apple kexts to keep (`scripts/apple-kc/keep.txt`), the pointers to rebind, AMFI's platform version |
-| `scripts/kclink`, `scripts/apple-kc` | the linker and the user-side scripts (GPL-2.0-only), shipped with the kit |
+| `scripts/kclink`, `scripts/apple-kc`, `scripts/kc-amfi-platform.py` | the linker and the user-side scripts (GPL-2.0-only), shipped with the kit but not in it (`package.sh` writes the four files above): unpacked as `/opt/xnulinux/scripts` (§4) |
 
 The kernel's segment slots are laid out for one macOS build (today 27.2, `26B123`, `kernelcache.release.vma2`). Each
 macOS build we support gets its own kit, and `link.sh` refuses any other kernelcache.
@@ -97,6 +98,8 @@ We ship these. The user's disk script installs them into their own macOS disk:
    CPUS=2
    RAM_MB=7900
    ```
+   Run it as the user the service is to run as. The service has no terminal, so that user needs sudo without a
+   password (a `NOPASSWD` rule), or run the installer as root.
 5. **Isolation.** The hosted kernel runs at EL1 inside the Linux kernel, so a hosted system that is compromised owns
    that Linux. **The tenant boundary is the VM (or the machine), never the Linux.** Run one Linux VM per tenant, with one
    hosted system in it. Never run two users' hosted systems in one Linux.
@@ -117,7 +120,7 @@ Apple's installer (`tart` or another Virtualization.framework installer).
    the IM4P or an unpacked kernelcache can be given as a second argument instead. The output is the same byte for byte
    on every machine.
 2. **System disk: Apple's installer, on a Mac.** Install macOS from Apple's IPSW into a Virtualization.framework
-   disk (`tart create NAME --from-ipsw …`), then run `scripts/mk-macvm-disk.sh` on an APFS clone of it. It merges the
+   disk (`tart create NAME --from-ipsw …`), then run `SRC=~/.tart/vms/NAME/disk.img scripts/mk-macvm-disk.sh` (it works on an APFS clone of it). It merges the
    OS cryptex into the system volume (`docs/production.md` §3), adds to the Data volume: the local user and automatic login, the Metal plugin (§2.4), the
    console shell, and a list of disabled hardware daemons. It also takes the static trust cache from the disk's own
    Preboot volume. It sends `mac.img`, `mac.conf` and `trustcache-mac.bin` to the Linux host.
@@ -142,10 +145,10 @@ Apple's installer (`tart` or another Virtualization.framework installer).
 | Gap | Effect on the service |
 |---|---|
 | PureDarwin's userland `libcorecrypto` is PureDarwin's unaudited interim fork (§2.3) | replace it on the PureDarwin disk before offering it for anything that keeps secrets |
-| Making the macOS disk needs a Mac with Xcode and `tart` (`mk-macvm-disk.sh`), and the PureDarwin disk needs `hdiutil` (`mk-puredarwin-disk.sh`) | users need a Mac to make their macOS disk; a Linux disk maker (from the IPSW's APFS images) would remove that. Check `tart`'s own license for commercial use, or use another Virtualization.framework installer. The PureDarwin disk should move to a Linux build (`mkfs.hfsplus`) so the pipeline runs without a Mac |
+| Making the macOS disk needs a Mac with Xcode and `tart` (`mk-macvm-disk.sh`) | users need a Mac to make their macOS disk; a Linux disk maker (from the IPSW's APFS images) would remove that. Check `tart`'s own license for commercial use, or use another Virtualization.framework installer. The PureDarwin disk needs none: `mk-puredarwin-disk.sh` makes it on the Linux host (`mkfs.hfsplus`) as well |
 | One kit per macOS build, fixed segment slots | each macOS release needs a new kit before users can update |
 | AMFI relaxed (`amfi_get_out_of_my_way=1`) and SIP partly off (`lp-sip0`); the OS cryptex merged into the system volume | the hosted macOS is less locked down than a real Mac. State this in the service's documentation (`docs/production.md` §3) |
 | The keystore is fresh at every boot | FileVault-style data protection does not persist across reboots |
-| GPU bridge only for virtio-gpu (Venus) | Mac hosts get the host GPU. Bare-metal hosts render on the CPU |
+| GPU bridge: virtio-gpu (Venus), or virglrenderer on the host's own Vulkan driver (tested on a DGX Spark) | Mac hosts and the DGX Spark get the host GPU; other bare-metal hosts are untested |
 | Bare-metal hosts need their own carve-out layout (`mem=`, `carve_base`) | one layout per host model, set up when it is provisioned |
 | `xnu.ko` built on the host at boot | needs kernel headers and a compiler on the host. Package it as DKMS |

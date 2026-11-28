@@ -62,8 +62,16 @@ extern unsigned int linux64_ipi_pending[LINUX64_CPU_SLOTS];
 /* enum linux64_counter */
 extern unsigned long linux64_dbg[LINUX64_NCOUNTERS];
 
-/* A call into the host (enum linux64_call). The host's answer: 0 to go on. */
-static inline unsigned long
+/*
+ * A call into the host (enum linux64_call). The host's answer: 0 to go on.
+ *
+ * The host keeps none of the FP/SIMD registers across it: it saves none of them, and where it lets Linux run (idle,
+ * preempted, file I/O, the network, a host call) they come back as the last Linux task or kernel-mode NEON user left
+ * them (Linux keeps no FP/SIMD state for a kernel thread). That includes d8-d15, which a callee owes its caller: the
+ * function that makes the call saves them. Not inline, so that this is the one function, and only when a call is made
+ * (inline, every function with a call in it saved them on every entry: ml_set_interrupts_enabled, each time).
+ */
+__attribute__((noinline, unused)) static unsigned long
 linux64_call2(enum linux64_call call, unsigned long a1, unsigned long a2)
 {
 	register unsigned long x0 __asm__("x0") = (unsigned long)call;
@@ -76,7 +84,10 @@ linux64_call2(enum linux64_call call, unsigned long a1, unsigned long a2)
 		    : "+r"(x0), "+r"(x1), "+r"(x2)
 		    : "r"(linux64_hook)
 		    : "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17",
-		    "x30", "cc", "memory");
+		    "x30", "cc", "memory",
+		    "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
+		    "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30",
+		    "v31");
 	}
 	return x0;
 }

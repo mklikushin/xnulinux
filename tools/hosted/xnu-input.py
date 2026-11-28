@@ -10,7 +10,7 @@
       scroll N          wheel N notches (the event system scales them by their rate; with natural scrolling, positive: down)
       scrollpx X Y      scroll by pixels, right and down positive (XnuInput's scroll service: exact, as a trackpad's)
       type TEXT         type TEXT (US layout)
-      key NAME...       press and release keys together (e.g. key cmd space, key return)
+      key NAME...       press and release keys together (e.g. key cmd space, key return, key cmd ,)
       sleep SECONDS
 Several commands can follow one another: xnu-input.py click 640 400 type hello key return
 """
@@ -34,6 +34,17 @@ PLAIN = {'-': 12, '=': 13, '[': 26, ']': 27, ';': 39, "'": 40, '`': 41, '\\': 43
          '\n': 28, '\t': 15}
 SHIFTED = {'!': '1', '@': '2', '#': '3', '$': '4', '%': '5', '^': '6', '&': '7', '*': '8', '(': '9', ')': '0', '_': '-',
            '+': '=', '{': '[', '}': ']', ':': ';', '"': "'", '~': '`', '|': '\\', '<': ',', '>': '.', '?': '/'}
+
+
+def chord(ch):
+    """The keys that type ch on a US layout (shift first), or None when no key does."""
+    if ch in SHIFTED:
+        return [KEYS['shift'], KEYS.get(SHIFTED[ch]) or PLAIN[SHIFTED[ch]]]
+    if ch in PLAIN:
+        return [PLAIN[ch]]
+    if len(ch) == 1 and ch.isascii() and ch.isalnum():
+        return [KEYS['shift'], KEYS[ch.lower()]] if ch.isupper() else [KEYS[ch]]
+    return None
 
 
 class Input:
@@ -66,14 +77,7 @@ class Input:
 
     def type(self, text):
         for ch in text:
-            if ch in SHIFTED:
-                self.keys([KEYS['shift'], KEYS.get(SHIFTED[ch]) or PLAIN[SHIFTED[ch]]])
-            elif ch.isupper():
-                self.keys([KEYS['shift'], KEYS[ch.lower()]])
-            elif ch in KEYS:
-                self.keys([KEYS[ch]])
-            elif ch in PLAIN:
-                self.keys([PLAIN[ch]])
+            self.keys(chord(ch))
 
 
 def main(argv):
@@ -103,8 +107,11 @@ def main(argv):
             for s in range(1, 11):
                 d.move(x1 + (x2 - x1) * s / 10, y1 + (y2 - y1) * s / 10)
             d.button('left', False)
-        elif cmd == 'scroll':
-            d.ev(EV_REL, 8, int(argv[i])); d.syn(); i += 1
+        elif cmd == 'scroll':   # XnuInput's wheel is one signed byte a report (-127..127): a longer turn goes in steps
+            n = int(argv[i]); i += 1
+            while n:
+                step = max(-127, min(127, n))
+                d.ev(EV_REL, 8, step); d.syn(); n -= step
         elif cmd == 'scrollpx':
             x, y = int(float(argv[i]) * 3), int(float(argv[i + 1]) * 3); i += 2   # 120 units a line of 40 pixels
             d.ev(EV_KEY, 0x14a, 1); d.syn()                                      # BTN_TOUCH: a gesture
@@ -113,12 +120,17 @@ def main(argv):
             if y:
                 d.ev(EV_REL, 0x0b, y)                                            # REL_WHEEL_HI_RES
             d.syn(); d.ev(EV_KEY, 0x14a, 0); d.syn()
-        elif cmd == 'type':
+        elif cmd == 'type':     # all of it or none: text with a character missing is not what was asked for
+            missing = sorted({ch for ch in argv[i] if chord(ch) is None})
+            if missing:
+                sys.exit(f"type: no key on the US layout for {' '.join(map(repr, missing))}")
             d.type(argv[i]); i += 1
-        elif cmd == 'key':
+        elif cmd == 'key':      # names of KEYS, and the keys `type` knows by their character (key cmd ,)
             names = []
-            while i < len(argv) and argv[i] in KEYS:
-                names.append(KEYS[argv[i]]); i += 1
+            while i < len(argv) and (argv[i] in KEYS or argv[i] in PLAIN):
+                names.append(KEYS.get(argv[i]) or PLAIN[argv[i]]); i += 1
+            if not names:
+                sys.exit(f"key: no key named {argv[i]!r}" if i < len(argv) else 'key: which key?')
             d.keys(names)
         elif cmd == 'sleep':
             time.sleep(float(argv[i])); i += 1

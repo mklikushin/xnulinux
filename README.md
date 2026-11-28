@@ -114,8 +114,9 @@ Working on two arm64 Linux setups:
 - **Bare-metal NVIDIA DGX Spark (Ubuntu 24.04.5 LTS aarch64, Linux `7.0.0-1025-nvidia`)**:
   - Boots to the full macOS desktop (Screen Sharing and SSH working) directly on bare-metal arm64 Linux with `CPUS=4`
     and 8 GiB of RAM reserved for XNU.
-  - Currently renders on the CPU (Mesa lavapipe, `GPU=off`): `xnudrmd` only forwards `virtio-gpu` (Venus) ioctls today,
-    so hardware GPU pass-through on the GB10 GPU requires a new DRM bridge backend.
+  - Renders on the GB10 (`Virtio-GPU Venus (NVIDIA GB10)`, `GPU=auto`) through `xnudrmd`'s virglrenderer backend for a
+    render node that is not virtio-gpu (`gpu/xnu-drm/xnudrmd_virgl.c`, virglrenderer 1.2.0: `tools/dgx-spark/README.md`),
+    or on the CPU (Mesa lavapipe, `GPU=off`).
 
 Shipping it as a hosted service (what is distributed, what a user installs to run Apple's macOS) is in
 [`docs/hosted-service.md`](docs/hosted-service.md).
@@ -139,16 +140,23 @@ the system volume, AMFI is patched and SIP relaxed, and memory access is slower 
 1. `scripts/vm-xnu-build.sh` (on the arm64 Linux host, once): sets up the macOS-DroidVM Linux toolchain and builds XNU
    (`xnu-12377.121.6`) natively on arm64.
 2. `scripts/vm-xnu-rebuild.sh`: applies `xnu-patches/`, builds the kernel and `kexts/`, and links the kernel collection
-   with Apple's kexts from your macOS installation (`scripts/kclink`). To link that collection without building
-   anything, `scripts/apple-kc/link.sh`, on the machine that runs `xnu.ko`, takes a kit of the built kernel and kexts
-   and macOS 27.2's kernelcache, read from Apple's IPSW ([docs/free-kc.md](docs/free-kc.md)).
+   (`/lib/firmware/xnu/kc.bin`) with Apple's kexts from macOS 27.2's kernelcache (`scripts/kclink`), when that is at
+   `~/w/dvm/out/kc/kc27.bin`; without it no collection is linked. It comes from Apple's IPSW:
+   `python3 scripts/apple-kc/im4p.py URL ~/w/dvm/out/kc/kc27.bin`, the URL in `~/w/dvm/configs/macos-27.2-26B123.json`.
+   To link that collection without building anything, `scripts/apple-kc/link.sh`, on the machine that runs `xnu.ko`,
+   takes a kit of the built kernel and kexts and macOS 27.2's kernelcache, read from Apple's IPSW
+   ([docs/free-kc.md](docs/free-kc.md)).
 3. `scripts/mk-macvm-disk.sh` (on the Mac): turns a macOS VM disk made by Apple's installer into the hosted system's disk
    and copies it into the Linux VM.
-4. `scripts/xnulinux-boot.sh` (on the arm64 Linux host): builds `fki.ko` and `xnu.ko` against the running kernel, brings
+4. `scripts/vm-install-fki-service.sh` (on the arm64 Linux host, once, then reboot): Linux's `mem=`, and `fki.ko` loaded
+   at boot with the carve-out that is the hosted kernel's DRAM (without it the boot stops: `fki: carve-out ... overlaps
+   IORESOURCE_SYSTEM_RAM`). Then
+   `scripts/xnulinux-boot.sh` (on the arm64 Linux host): builds `fki.ko` and `xnu.ko` against the running kernel, brings
    up the network (and the GPU bridge when there is a render node) and boots the hosted system. Its console is
    `scripts/xnu-console.sh`, its screen `tools/hosted/fb2png.py`, input `tools/hosted/xnu-input.py`. On a bare-metal
    host (such as a DGX Spark), set the carve-out (`mem=`, `carve_base=`, `carve_mb=`) to fit the machine's physical
-   memory layout, and set `GPU=off` (`xnudrmd` supports only virtio-gpu for now).
+   memory layout; its GPU needs virglrenderer installed before `xnudrmd` is built (`tools/dgx-spark/README.md`), or
+   `GPU=off`.
 5. `scripts/install-service.sh` (on the arm64 Linux host): runs it as `xnulinux.service`, configured in
    `/etc/xnulinux.conf` (CPUs, memory, disk, GPU). On the Mac, `scripts/install-krun-agent.sh` keeps the VM itself
    running.

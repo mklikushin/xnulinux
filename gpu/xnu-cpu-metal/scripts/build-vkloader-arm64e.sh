@@ -32,3 +32,7 @@ build_arch() {
 
 build_arch arm64
 build_arch arm64e
+
+# the arm64 loader where scripts/build-m2v.sh takes it from (it goes beside lavapipe's driver)
+mkdir -p "$ROOT/build/vk-deps/vulkan-loader/1.4.363.0/lib"
+cp -f "$ROOT/build/vkloader-arm64-install/lib/libvulkan.1.4.363.dylib" "$ROOT/build/vk-deps/vulkan-loader/1.4.363.0/lib/"

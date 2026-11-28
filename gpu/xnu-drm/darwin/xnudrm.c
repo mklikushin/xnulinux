@@ -43,7 +43,7 @@ static struct xnode { int fd; io_connect_t conn; } nodes[64];	/* open render nod
 static unsigned nnodes;
 static struct xmap { void *va; size_t len; uint64_t id; io_connect_t conn; } *maps;
 static unsigned nmaps;
-static struct xfence { dev_t dev; ino_t ino; int wfd; uint64_t id; io_connect_t conn; } *fences;
+static struct xfence { dev_t dev; ino_t ino; int wfd; uint64_t id; io_connect_t conn; unsigned refs; } *fences;	/* refs: descriptors of the read end */
 static unsigned nfences;
 struct xsfence { uint64_t id; io_connect_t conn; unsigned refs; };
 static struct xsfd { int fd; struct xsfence *f; } *sfds;	/* sandbox fences (when SYS_pipe is denied) */
@@ -51,6 +51,7 @@ static unsigned nsfds;
 static uint8_t *buf;			/* message, then reply */
 
 extern int os_dupfd_cloexec(int fd);
+static struct xfence *fence_of(int fd);
 
 /* Open a harmless placeholder fd for a render node or sandbox fence.
  * Strict sandboxes (e.g. com.apple.WebKit.GPUProcess.sb) deny open("/dev/null")
@@ -183,6 +184,12 @@ int xnudrm_close(int fd)
 			break;
 		}
 	}
+	struct xfence *f = nfences ? fence_of(fd) : NULL;
+	if (f && --f->refs == 0) {	/* the read end's last descriptor: nobody can wait for this fence any more */
+		if (f->wfd >= 0) close(f->wfd);
+		if (f->id) { conn = f->conn; hdr(XNUDRM_FENCE_CLOSE, f->id, 0); call(0); }
+		*f = fences[--nfences];
+	}
 	pthread_mutex_unlock(&lk);
 	return close(fd);
 }
@@ -205,6 +212,8 @@ int xnudrm_dupfd_cloexec(int fd)
 	}
 	if (nfd < 0) { pthread_mutex_unlock(&lk); return -1; }
 	forget_sfd(nfd);
+	struct xfence *f = nfences ? fence_of(fd) : NULL;
+	if (f) f->refs++;
 	for (unsigned i = 0; i < nsfds; i++) {
 		if (sfds[i].fd == fd) {
 			struct xsfence *sf = sfds[i].f;
@@ -271,7 +280,7 @@ static int new_fence(uint64_t id)	/* for conn */
 		struct xfence *nf = realloc(fences, (nfences + 1) * sizeof(*fences));
 		if (!nf) { close(p[0]); close(p[1]); errno = ENOMEM; return -1; }
 		fences = nf;
-		fences[nfences++] = (struct xfence){ st.st_dev, st.st_ino, p[1], id, conn };
+		fences[nfences++] = (struct xfence){ st.st_dev, st.st_ino, p[1], id, conn, 1 };
 		return p[0];
 	}
 	if (!denied && errno != EPERM) return -1;

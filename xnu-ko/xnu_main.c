@@ -106,16 +106,16 @@ module_param(xo_compat, int, 0444);
 static char *el0_fips_sha256 = "";
 module_param(el0_fips_sha256, charp, 0444);
 
-__attribute__((target("branch-protection=none"), noreturn))
+/* fki_pac_swap failed in an EL0 upcall: said here (XNU's keys may still be loaded); world.S then ends the run */
+__attribute__((target("branch-protection=none")))
 void xnu_world_pac_abort_el0(int err);
-__attribute__((target("branch-protection=none"), noreturn))
+__attribute__((target("branch-protection=none")))
 void xnu_world_pac_abort_el0(int err)
 {
-	static const char msg[] = "xnu: FATAL: fki_pac_swap failed in EL0 upcall\n";
+	static const char msg[] = "xnu: fki_pac_swap failed in EL0 upcall; ending the run\n";
 
 	(void)err;
 	fki_log_alert(msg, sizeof(msg) - 1);
-	BUG();
 }
 
 static struct xnu_image img;
@@ -193,6 +193,19 @@ module_param(preboot_uuid, charp, 0444);
 static char *root_uuid;
 module_param(root_uuid, charp, 0444);
 static char root_matching[256];
+/* One of the three as XNU takes it (uuid_parse: kern.bootuuid, kern.apfsprebootuuid): 8-4-4-4-12 hexadecimal digits; an empty one is none */
+static int uuid_ok(const char *s)
+{
+	int i;
+
+	if (!s || !s[0]) return 1;
+	for (i = 0; s[i] && i < 36; i++) {
+		char c = s[i];
+		if (i == 8 || i == 13 || i == 18 || i == 23 ? c != '-' : !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+			return 0;
+	}
+	return i == 36 && !s[i];
+}
 static void *in_file; static fki_u64 in_off;
 struct xnu_world xnu_W;
 
@@ -200,8 +213,8 @@ static void logs(const char *s) { fki_log(s, x_strlen(s)); }
 static void logs_alert(const char *s) { fki_log_alert(s, x_strlen(s)); }
 static void logkv(const char *k, u64_t v)
 {
-	char buf[96]; char *p = buf;
-	while (*k) *p++ = *k++;
+	char buf[128]; char *p = buf;
+	while (*k && p < buf + sizeof(buf) - 20) *p++ = *k++;	/* the value's " 0x", 16 digits and NUL always fit: a longer key is cut */
 	*p++ = ' '; *p++ = '0'; *p++ = 'x';
 	for (int i = 60; i >= 0; i -= 4) *p++ = "0123456789abcdef"[(v >> i) & 15];
 	*p = 0;
@@ -323,6 +336,11 @@ static unsigned long kfault_moved;	/* kernel faults whose vm_fault came back on 
 
 #define XNU_VA_LO 0xffffffe000000000ULL
 #define XNU_VA_HI 0xfffffffc00000000ULL
+/*
+ * XNU takes less memory than half of that window, the image and the boot data included (56 GiB): from there its
+ * arm_vm_init panics ("Unsupported memory configuration").
+ */
+#define XNU_MEM_MAX ((XNU_VA_HI - XNU_VA_LO) / 2)
 /*
  * A kernel fault XNU's vm_fault should resolve is not resolved here, inside Linux's exception handler (a kprobe: no
  * sleeping, no rescheduling, and a nested fault in it is a missed kprobe and an oops), because vm_fault may page in
@@ -457,9 +475,14 @@ static int xnu_fault(unsigned long far, unsigned long esr, void *regs)
 		unsigned long *fp = (unsigned long *)fki_regs_reg(regs, 29);
 		for (int i = 0; i < 12 && fp && !((unsigned long)fp & 15) && (unsigned long)fp >= XNU_VA_LO &&
 		    (unsigned long)fp < XNU_VA_HI; i++) {
-			logkv("xnu:   frame", fp[1] | 0xffffff8000000000ul);
-			if ((unsigned long *)fp[0] <= fp) break;
-			fp = (unsigned long *)fp[0];
+			fki_u64 w0, w1;
+			/* a frame that is not mapped ends the walk (XNU's stack may be what went wrong): read directly it
+			 * faulted here, in the exception handler with XNU's keys loaded, the oops this path is there to avoid */
+			if (fki_high_read_u64x2((unsigned long)fp, &w0, &w1) != 0)
+				break;
+			logkv("xnu:   frame", w1 | 0xffffff8000000000ul);
+			if ((unsigned long *)w0 <= fp) break;
+			fp = (unsigned long *)w0;
 		}
 	}
 	fki_regs_set_pc(regs, (unsigned long)xnu_world_fault_abort);
@@ -1064,13 +1087,10 @@ static long xnu_hook_body(unsigned long call, unsigned long a1, unsigned long a2
 			for (i = 0; i < 24 && fp && !((unsigned long)fp & 15) &&
 			     (unsigned long)fp >= fp_lo && (unsigned long)fp + 16 <= fp_hi; i++) {
 				fki_u64 w0, w1;
-				if (el0_mode) {
-					if (fki_high_read_u64x2((unsigned long)fp, &w0, &w1) != 0)
-						break;
-				} else {
-					w0 = fp[0];
-					w1 = fp[1];
-				}
+				/* on either host: a frame that is not mapped ends the walk (a panic's stack may be damaged; read
+				 * directly, Linux oopsed here with interrupts off in place of the panic's report) */
+				if (fki_high_read_u64x2((unsigned long)fp, &w0, &w1) != 0)
+					break;
 				unsigned long lr = (unsigned long)w1 | 0xffffff8000000000ul;
 				unsigned long *next = (unsigned long *)w0;
 				logkv("xnu:   frame", lr);
@@ -1184,6 +1204,11 @@ static struct boot_args_v2 *build_boot(unsigned char *base_va, u64_t phys, u64_t
 	struct adt a;
 	static unsigned char seed[256];
 
+	/* (ram_mb alone is below it: xnu_init) */
+	if (size >= XNU_MEM_MAX) {
+		logkv("xnu: ram_mb with the image and the boot data is more than XNU takes, by (bytes)", size - XNU_MEM_MAX + 1);
+		return 0;
+	}
 	fki_random(seed, sizeof(seed));
 	/*
 	 * XNU identifies its CPUs by MPIDR: its CPU 0 runs here, bound to Linux CPU 0; CPUs 1 .. cpus-1 are Linux's of the
@@ -1235,10 +1260,11 @@ static struct boot_args_v2 *build_boot(unsigned char *base_va, u64_t phys, u64_t
 		x_memcpy(root_matching + sizeof(pre) - 1, root_uuid, 36);
 		x_memcpy(root_matching + sizeof(pre) - 1 + 36, post, sizeof(post));
 	}
-	adt_node(&a, 22 + (boot_uuid ? 1 : 0) + (preboot_uuid ? 1 : 0) + (root_matching[0] ? 1 : 0), 3);	/* /chosen */
+	/* (an empty boot_uuid went in as it was, and XNU waited for the root volume of that UUID) */
+	adt_node(&a, 22 + (boot_uuid && boot_uuid[0] ? 1 : 0) + (preboot_uuid && preboot_uuid[0] ? 1 : 0) + (root_matching[0] ? 1 : 0), 3);	/* /chosen */
 	if (root_matching[0]) adt_prop_str(&a, "root-matching", root_matching);
-	if (boot_uuid) adt_prop_str(&a, "boot-uuid", boot_uuid);
-	if (preboot_uuid) adt_prop_str(&a, "apfs-preboot-uuid", preboot_uuid);
+	if (boot_uuid && boot_uuid[0]) adt_prop_str(&a, "boot-uuid", boot_uuid);
+	if (preboot_uuid && preboot_uuid[0]) adt_prop_str(&a, "apfs-preboot-uuid", preboot_uuid);
 	adt_prop_str(&a, "name", "chosen");
 	adt_prop_u64(&a, "dram-base", phys);
 	adt_prop_u64(&a, "dram-size", size);
@@ -1279,7 +1305,8 @@ static struct boot_args_v2 *build_boot(unsigned char *base_va, u64_t phys, u64_t
 	adt_node(&a, 1 + (rd_size ? 1 : 0) + (tc_size ? 1 : 0), 0);	/* /chosen/memory-map (no AuxKC) */
 	adt_prop_str(&a, "name", "memory-map");
 	if (rd_size) {
-		u64_t rd[2] = { phys + off_rd, rd_size };
+		/* in whole 4 KB pages, as XNU makes md0 of it (IOFindBSDRoot: size >> 12): a last page's part was cut off the disk */
+		u64_t rd[2] = { phys + off_rd, (rd_size + 0xfff) & ~0xfffULL };
 		adt_prop(&a, "RAMDisk", rd, sizeof(rd));
 	}
 	if (tc_size) {
@@ -1416,8 +1443,15 @@ static struct boot_args_v2 *build_boot(unsigned char *base_va, u64_t phys, u64_t
 		if (x_strlen(ba->CommandLine) + x_strlen(a) < sizeof(ba->CommandLine))
 			x_memcpy(ba->CommandLine + x_strlen(ba->CommandLine), a, x_strlen(a) + 1);
 	}
-	if (bootargs && x_strlen(ba->CommandLine) + 1 + x_strlen(bootargs) < sizeof(ba->CommandLine)) {
+	if (bootargs) {
 		char *e = ba->CommandLine + x_strlen(ba->CommandLine);
+
+		/* (dropped whole and in silence before: the system came up without any of them and failed somewhere else) */
+		if (x_strlen(ba->CommandLine) + 1 + x_strlen(bootargs) >= sizeof(ba->CommandLine)) {
+			logkv("xnu: bootargs do not fit in XNU's command line; characters it has left",
+			    sizeof(ba->CommandLine) - x_strlen(ba->CommandLine) - 2);
+			return 0;
+		}
 		*e++ = ' ';
 		x_memcpy(e, bootargs, x_strlen(bootargs) + 1);
 	}
@@ -1536,13 +1570,9 @@ static int monitor_fn(void *arg)
 					logkv("xnu:   lr at that call", w->xnu_regs[11]);
 					for (int f = 0; f < 16 && fp >= XNU_VA_LO && fp < XNU_VA_HI && !(fp & 7); f++) {
 						fki_u64 w0, w1;
-						if (el0_mode) {
-							if (fki_high_read_u64x2(fp, &w0, &w1) != 0)
-								break;
-						} else {
-							w0 = ((unsigned long *)fp)[0];
-							w1 = ((unsigned long *)fp)[1];
-						}
+						/* the frame pointer is from the CPU's last host call: that stack may be gone since */
+						if (fki_high_read_u64x2(fp, &w0, &w1) != 0)
+							break;
 						unsigned long next = (unsigned long)w0;
 						logkv("xnu:   frame", w1);
 						if (next <= fp || next - fp > 0x100000UL) break;
@@ -2076,6 +2106,7 @@ static int enter_arm_init(struct boot_args_v2 *ba)
 		u64_t mh_unslid = 0;
 		int segs = macho_slide_header(&img, &mh_unslid);
 		logkv("xnu: load commands slid (segments)", (u64_t)segs);
+		if (segs < 0) return segs;
 	}
 	if (el0_mode)
 		el0_patch_image(&img);
@@ -2174,8 +2205,21 @@ static int enter_arm_init(struct boot_args_v2 *ba)
 		}
 		xnu_kfault_recover = (void *)a_kfr;
 	}
-	if (!el0_mode && xnu_kfault && fki_fault_register(0xffffffe000000000ULL, 0xfffffffc00000000ULL, xnu_fault) == 0)
+	if (!el0_mode && xnu_kfault) {
+		/*
+		 * XNU's kernel takes page faults all the time (vm_fault on its kernel map). Where the host cannot hand them
+		 * over (fki's probe on Linux's fault path did not register on this kernel) the first one is a Linux oops with
+		 * XNU's keys and stack live: XNU is not started there.
+		 */
+		int ferr = fki_fault_register(0xffffffe000000000ULL, 0xfffffffc00000000ULL, xnu_fault);
+		if (ferr) {
+			logkv("xnu: the host cannot forward XNU's kernel faults: not starting, err", (u64_t)ferr);
+			fki_thread_stop(monitor); monitor = 0;
+			fki_thread_stop(fb_thread); fb_thread = 0;
+			return ferr;
+		}
 		logs("xnu: kernel faults on XNU addresses go to XNU's vm_fault");
+	}
 	if (!el0_mode) {
 		/*
 		 * XNU's user half starts as Linux's TTBR0. Its TCR stays Linux's (T0SZ 16, 4-level): a 4K XNU user pmap's
@@ -2396,12 +2440,21 @@ static void xnu_cleanup(void)
 static int __init xnu_init(void)
 {
 	const void *data; unsigned long size;
+	u64_t extra;
 	int err;
 
 	if (fki_version() != FKI_VERSION)
 		return -22;
-	if (ram_mb <= 0 || ram_mb > 65536)
+	/* (up to 65536 was taken, and the hosted kernel panicked on the memory once the host had found it) */
+	if (ram_mb <= 0 || (u64_t)ram_mb << 20 >= XNU_MEM_MAX) {
+		logkv("xnu: ram_mb must be 1 or more, and less than (MiB)", XNU_MEM_MAX >> 20);
 		return -22;
+	}
+	/* (one that is not: root_uuid was left out without a word, the two others went to XNU, which does not take them) */
+	if (!uuid_ok(root_uuid) || !uuid_ok(boot_uuid) || !uuid_ok(preboot_uuid)) {
+		logs("xnu: root_uuid, boot_uuid and preboot_uuid are UUIDs: 8-4-4-4-12 hexadecimal digits");
+		return -22;
+	}
 	el0_mode = !!(fki_caps() & FKI_CAP_EL0);
 	logkv("xnu: FKI caps", fki_caps());
 	if (el0_mode && !(fki_caps() & FKI_CAP_PAC)) {
@@ -2448,7 +2501,13 @@ static int __init xnu_init(void)
 	}
 	err = fki_blob_get(image, &data, &size, &blob);
 	if (err) { logkv("xnu: cannot read image, err", (u64_t)err); goto fail; }
-	err = macho_load(&img, data, size, mode == 3 ? ~0UL : mode == 2 ? (unsigned long)ram_mb << 20 : 0);
+	/*
+	 * run_m2a's region (every mode but 1 and 3): the image, room for the boot data build_boot puts after it (run_m2b's
+	 * sum), then ram_mb. The RAM alone left a RAM disk or a framebuffer larger than it to be written past the region.
+	 */
+	extra = 0x60000 + BOOT_EXTRA + ((u64_t)ram_mb << 20);
+	if (extra < BOOT_EXTRA) { logs("xnu: ram_mb overflow"); err = -22; goto fail; }
+	err = macho_load(&img, data, size, mode == 3 ? ~0UL : mode == 1 ? 0 : (unsigned long)extra);
 	if (err) { logkv("xnu: load failed", (u64_t)err); goto fail; }
 	logkv("xnu: image vmlow", img.vmlow);
 	logkv("xnu: image size", img.vmhigh - img.vmlow);

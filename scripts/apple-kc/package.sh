@@ -13,8 +13,12 @@ set -euo pipefail
 POC=$(cd "$(dirname "$0")/../.." && pwd)
 DVM=${DVM:-$HOME/w/dvm}; KIT=${1:-$HOME/w/apple-kc-kit}
 [ -s "$DVM/out/k27/natives.txt" ] || { echo "$DVM/out/k27/natives.txt: run scripts/vm-xnu-rebuild.sh (with out/kc/kc27.bin) first" >&2; exit 1; }
+[ -s "$DVM/out/kc/kc27.bin" ] || { echo "$DVM/out/kc/kc27.bin: the kernelcache the kit is for is not there (kit.json names its sha256)" >&2; exit 1; }
 mapfile -t lines < "$DVM/out/k27/natives.txt"	# one kext description a line, paths whole (a file not read stops here)
 natives=(); for l in "${lines[@]}"; do [ -n "$l" ] && natives+=("$l"); done
+# KIT is replaced whole: only a kit (or nothing) may be there, not a directory that holds something else
+[ ! -e "$KIT" ] || [ -e "$KIT/kit.json" ] || { [ -d "$KIT" ] && [ -z "$(ls -A "$KIT")" ]; } ||
+	{ echo "$KIT: exists and is not a kit (no kit.json): not replacing it" >&2; exit 1; }
 rm -rf "$KIT"; mkdir -p "$KIT/kexts"
 cp "$DVM/out/k27/kernel-k27.macho" "$KIT/kernel.macho"
 [ -e /lib/firmware/xnu/kc-free.bin ] && cp /lib/firmware/xnu/kc-free.bin "$KIT/kc-free.bin"

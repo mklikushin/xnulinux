@@ -962,6 +962,20 @@ struct fki_hm_page {
 
 static void fki_high_unmap_km(struct fki_kmem *km, unsigned long va, unsigned long size);
 
+/*
+ * A change to the window failed and what it had already changed could not be put back: the window is no longer what
+ * the foreign kernel was told. That is the foreign kernel's loss, not Linux's (the window maps only the region's own
+ * frames, at addresses only the foreign kernel uses), so the host does not panic: the window is marked dead, every
+ * later call on it fails (fki_kmem_get), and the foreign kernel ends its run over the first that it needs.
+ * Called with km->lock held.
+ */
+static void fki_high_dead(struct fki_kmem *km, unsigned long va)
+{
+	if (!READ_ONCE(km->dead))
+		pr_alert("fki: the high window could not be put back at %#lx after a failed change: unusable from here on\n", va);
+	WRITE_ONCE(km->dead, true);
+}
+
 int fki_high_map(unsigned long va, fki_u64 xpa, unsigned long size, int prot)
 {
 	struct fki_kmem *km = fki_kmem_get();
@@ -1134,11 +1148,11 @@ int fki_high_map(unsigned long va, fki_u64 xpa, unsigned long size, int prot)
 				if (xa_err(xa_store(&km->dyn_slots, vpn,
 						    fki_as_mk_entry(old_cptr, pgs[i].new_pfn, eff_lprot),
 						    GFP_ATOMIC))) {
-					if (l4h_page_map(old_cptr, high_vs, cur_va, (int)pgs[i].prev_prot) != 0) {
-						WRITE_ONCE(km->dead, true);
-						panic("fki: unrecoverable high_map rollback failure at %#lx", cur_va);
-					}
 					err = -ENOMEM;
+					if (l4h_page_map(old_cptr, high_vs, cur_va, (int)pgs[i].prev_prot) != 0) {
+						fki_high_dead(km, cur_va);	/* the page keeps the new protection, its record the old */
+						err = -EIO;
+					}
 					break;
 				}
 			}
@@ -1176,8 +1190,8 @@ int fki_high_map(unsigned long va, fki_u64 xpa, unsigned long size, int prot)
 
 					if (!cptr ||
 					    l4h_page_map(cptr, high_vs, cur_va, (int)pgs[j].prev_prot) != 0) {
-						WRITE_ONCE(km->dead, true);
-						panic("fki: unrecoverable high_map rollback failure at %#lx", cur_va);
+						fki_high_dead(km, cur_va);	/* the page stays as the change left it */
+						continue;
 					}
 					xa_store(&km->dyn_slots, vpn,
 						 fki_as_mk_entry(cptr, pgs[j].prev_pfn, pgs[j].prev_prot),
@@ -1362,12 +1376,10 @@ int fki_high_txn_begin(unsigned long va, unsigned long size, void **handle_out)
 						unsigned long prev_va = va + (j << PAGE_SHIFT);
 						unsigned long prev_vpn = prev_va >> PAGE_SHIFT;
 
+						/* not mapped again: its slot is recorded below all the same, for kmem_cleanup */
 						if (l4h_page_map(txn->pages[j].cptr, high_vs,
-								 prev_va, (int)txn->pages[j].prot) != 0) {
-							WRITE_ONCE(km->dead, true);
-							panic("fki: unrecoverable high_txn_begin rollback failure at %#lx",
-							      prev_va);
-						}
+								 prev_va, (int)txn->pages[j].prot) != 0)
+							fki_high_dead(km, prev_va);
 						xa_store(&km->dyn_slots, prev_vpn,
 							 fki_as_mk_entry(txn->pages[j].cptr,
 									 txn->pages[j].pfn,

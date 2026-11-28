@@ -12,8 +12,9 @@ OBJCOPY="/opt/homebrew/opt/llvm@22/bin/llvm-objcopy"
 mkdir -p "$DIST_DIR/lib" "$DIST_DIR/include"
 rm -rf "$WORK" && mkdir -p "$WORK/objs"
 
-# 1. Build Rust staticlib for arm64e-apple-darwin with -Zbuild-std
-export RUSTUP_TOOLCHAIN=nightly-aarch64-apple-darwin
+# 1. Build Rust staticlib for arm64e-apple-darwin with -Zbuild-std: the nightly the pinned metal2vulkan names in its own
+# rust-toolchain.toml (RUST_NIGHTLY to try another), not whichever nightly rustup has today
+export RUSTUP_TOOLCHAIN="${RUST_NIGHTLY:-nightly-2026-11-03}-aarch64-apple-darwin"
 cargo build --manifest-path "$BRIDGE_DIR/Cargo.toml" \
   -Zbuild-std=std,panic_unwind \
   --target arm64e-apple-darwin \

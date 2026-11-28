@@ -47,13 +47,15 @@ locked "$KRUN"/bin/krunkit --cpus "$CPUS" --memory "$MEM" \
   --restful-uri "unix://$S/rest.sock" --pidfile "$S/krunkit.pid" --log-file "$S/krunkit.log" &
 KR=$!
 trap 'kill $KR $GV 2>/dev/null' EXIT
-api() { curl -sf --unix-socket "$S/gvapi.sock" "http://gv$1" "${@:2}"; }
+api() { curl -s --fail-with-body --unix-socket "$S/gvapi.sock" "http://gv$1" "${@:2}"; }	# an HTTP error: status 22 and gvproxy's reason
 for _ in $(seq 1 120); do
   ip=$(api /services/dhcp/leases | python3 -c 'import json,sys; m=sys.argv[1].lower(); print(next((k for k,v in json.load(sys.stdin).items() if v.lower()==m), ""))' "$MAC" 2>/dev/null || true)
   [ -n "$ip" ] && break; sleep 1
 done
 if [ -n "$ip" ]; then
-  api /services/forwarder/expose -X POST -d "{\"local\":\"127.0.0.1:$SSH_PORT\",\"remote\":\"$ip:22\"}" && echo "ssh: 127.0.0.1:$SSH_PORT -> $ip:22"
+  # gvproxy says why not (SSH_PORT taken: "listen tcp ...: bind: address already in use"); the VM runs on, without ssh
+  why=$(api /services/forwarder/expose -X POST -d "{\"local\":\"127.0.0.1:$SSH_PORT\",\"remote\":\"$ip:22\"}") &&
+    echo "ssh: 127.0.0.1:$SSH_PORT -> $ip:22" || echo "no ssh: gvproxy did not forward 127.0.0.1:$SSH_PORT to the guest: ${why:-no answer}" >&2
 else
   echo "the guest never took a DHCP lease" >&2
 fi

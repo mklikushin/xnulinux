@@ -33,6 +33,7 @@ class XnuEthernet : public IOEthernetController {
     OSDeclareDefaultStructors(XnuEthernet)
 
     IOEthernetInterface *fInterface = nullptr;
+    IONetworkStats *fStats = nullptr;   // the interface's counts of packets and errors sent: the driver keeps them (netstat's Opkts, Oerrs)
     IOEthernetAddress fAddress = {{0x02, 0x58, 0x4e, 0x55, 0x00, 0x01}};   // locally administered, "XNU" (the kernel's en0 had it)
     IOLock *fTxLock = nullptr;
     uint8_t fTx[frameBytes + 64], fRx[frameBytes + 64];
@@ -83,6 +84,8 @@ bool XnuEthernet::start(IOService *provider)
         IOLog("XnuEthernet: cannot attach the interface\n");
         return false;
     }
+    if (IONetworkData *data = fInterface->getNetworkData(kIONetworkStatsKey))
+        fStats = static_cast<IONetworkStats *>(const_cast<void *>(data->getBuffer()));
     // IOTimeSyncClockManager takes the clock identifier from the built-in interfaces only and looks once, at its start
     fInterface->setProperty(kIOBuiltin, true);
     fInterface->registerService(kIOServiceSynchronous);
@@ -131,21 +134,25 @@ IOReturn XnuEthernet::disable(IONetworkInterface *interface)
 }
 
 // No output queue: the interface calls in from the stack's threads, so the one transmit buffer is taken under a lock.
+// The return value goes to the stack as if_output's errno (IONetworkInterface::if_output): a frame dropped here is lost like one
+// dropped on the wire, 0; an output queue's kIOReturnOutputDropped (1) would be EPERM to the sender.
 UInt32 XnuEthernet::outputPacket(mbuf_t packet, void *param)
 {
     size_t length = mbuf_pkthdr_len(packet);
     if (!fEnabled || length < ETHER_HDR_LEN || length > frameBytes) {
         ++fTxDrops;
         freePacket(packet);
-        return kIOReturnOutputDropped;
+        return kIOReturnOutputSuccess;
     }
     IOLockLock(fTxLock);
     long sent = mbuf_copydata(packet, 0, length, fTx) == 0 ? linux64_net_send(fTx, length) : 0;
+    if (fStats)   // with no output queue the interface takes the output counts from here (IONetworkInterface::if_output)
+        ++(sent > 0 ? fStats->outputPackets : fStats->outputErrors);
     IOLockUnlock(fTxLock);
     freePacket(packet);
     if (sent <= 0) {
         ++fTxDrops;
-        return kIOReturnOutputDropped;
+        return kIOReturnOutputSuccess;
     }
     ++fTxPackets;
     fActive = true;

@@ -22,10 +22,11 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/version.h>
 #include <linux/vmalloc.h>
 #include <linux/wait.h>
 
-#define HC_MAX (8UL << 20)		/* largest request or reply */
+#define HC_MAX ((8UL << 20) + 4096)	/* largest request or reply: the DRM bridge's 8 MiB of payload and its header */
 #define HC_TIMEOUT (120 * HZ)		/* a service that does not answer: the call fails */
 
 struct xnu_hostcall_xlate {
@@ -53,6 +54,7 @@ static u64 hc_seq;			/* the call in flight (0: none) */
 static int hc_state;			/* 0 idle, 1 request waiting, 2 read by the service, 3 replied */
 static long hc_result;
 static int hc_open;			/* the service's opens of /dev/xnu-hostcall (0: no service, calls fail at once) */
+static int hc_copying;			/* a read() or write() is copying out of or into hc_buf: the call does not end under it */
 
 struct hc_call { const void *req; unsigned long len; void *reply; unsigned long max; long result; };
 static DEFINE_MUTEX(hc_mutex);		/* one call at a time through the single slot (several CPUs may call) */
@@ -89,6 +91,11 @@ static void hc_call_body(void *p)
 	/* until the reply, or the service closing its device with the call unanswered */
 	wait_event_timeout(hc_done_wait, READ_ONCE(hc_state) == 3 || !READ_ONCE(hc_open), HC_TIMEOUT);
 	spin_lock(&hc_lock);
+	while (hc_copying) {	/* the next call would fill hc_buf under the service's copy, or its late reply would land on it */
+		spin_unlock(&hc_lock);
+		wait_event(hc_done_wait, !READ_ONCE(hc_copying));
+		spin_lock(&hc_lock);
+	}
 	if (hc_state != 3) {
 		r = hc_open ? -ETIMEDOUT : -ENODEV;
 		hc_state = 0; hc_seq = 0;
@@ -130,6 +137,7 @@ EXPORT_SYMBOL(fki_hostcall);
 /* The service: read() the next request, prefixed with its 8-byte sequence number. */
 static ssize_t hc_read(struct file *f, char __user *buf, size_t n, loff_t *off)
 {
+	unsigned long len;
 	u64 seq;
 	int err;
 
@@ -137,42 +145,79 @@ static ssize_t hc_read(struct file *f, char __user *buf, size_t n, loff_t *off)
 	if (err)
 		return err;
 	spin_lock(&hc_lock);
-	if (hc_state != 1) {
+	if (hc_state != 1 || n < 8 + hc_len) {
+		err = hc_state != 1 ? -EAGAIN : -EMSGSIZE;	/* too small a buffer: the request stays, for a read() with room */
 		spin_unlock(&hc_lock);
-		return -EAGAIN;
+		return err;
 	}
 	hc_state = 2;
 	seq = hc_seq;
+	len = hc_len;
+	hc_copying = 1;
 	spin_unlock(&hc_lock);
-	if (n < 8 + hc_len)
-		return -EMSGSIZE;
-	if (copy_to_user(buf, &seq, 8) || copy_to_user(buf + 8, hc_buf, hc_len))
-		return -EFAULT;
-	return 8 + hc_len;
+	if (copy_to_user(buf, &seq, 8) || copy_to_user(buf + 8, hc_buf, len))
+		err = -EFAULT;
+	spin_lock(&hc_lock);
+	hc_copying = 0;
+	if (err)
+		hc_state = 1;		/* not delivered: the next read() gets it */
+	spin_unlock(&hc_lock);
+	wake_up(&hc_done_wait);
+	if (err)
+		wake_up_interruptible(&hc_req_wait);
+	return err ? err : 8 + len;
 }
 
 /* The service: write() the reply, prefixed with the request's sequence number. */
 static ssize_t hc_write(struct file *f, const char __user *buf, size_t n, loff_t *off)
 {
 	u64 seq;
+	int err = 0;
 
 	if (n < 8 || n - 8 > HC_MAX)
 		return -EINVAL;
 	if (copy_from_user(&seq, buf, 8))
 		return -EFAULT;
 	spin_lock(&hc_lock);
-	if (hc_state != 2 || seq != hc_seq) {
+	if (hc_state != 2 || seq != hc_seq || hc_copying) {
 		spin_unlock(&hc_lock);
 		return -ESTALE;		/* the call timed out meanwhile */
 	}
+	hc_copying = 1;
 	spin_unlock(&hc_lock);
 	if (copy_from_user(hc_buf, buf + 8, n - 8))
-		return -EFAULT;
-	hc_len = n - 8;
-	hc_result = 0;
-	WRITE_ONCE(hc_state, 3);
+		err = -EFAULT;		/* no reply yet: the service may write it again */
+	spin_lock(&hc_lock);
+	hc_copying = 0;
+	if (!err) {
+		hc_len = n - 8;
+		hc_result = 0;
+		hc_state = 3;
+	}
+	spin_unlock(&hc_lock);
 	wake_up(&hc_done_wait);
-	return n;
+	return err ? err : n;
+}
+
+/*
+ * The page frame behind va in a device mapping (VM_IO, VM_PFNMAP), with mmap_lock held. The kernel's call for it changed
+ * within the kernels of one Ubuntu release (24.04: 6.8, then 6.11, 6.14, 6.17 and 7.0 as HWE kernels): follow_pfn() up
+ * to 6.11, follow_pfnmap_start() from 6.12 (6.14 has no follow_pfn() any more).
+ */
+static int hc_device_pfn(struct vm_area_struct *vma, unsigned long va, unsigned long *pfn)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+	struct follow_pfnmap_args args = { .vma = vma, .address = va };
+	int err = follow_pfnmap_start(&args);
+
+	if (err)
+		return err;
+	*pfn = args.pfn;
+	follow_pfnmap_end(&args);
+	return 0;
+#else
+	return follow_pfn(vma, va, pfn);
+#endif
 }
 
 static long hc_xlate_one(struct mm_struct *mm, unsigned long va, u64 *pa)
@@ -183,12 +228,12 @@ static long hc_xlate_one(struct mm_struct *mm, unsigned long va, u64 *pa)
 	if (!vma)
 		return -EFAULT;
 	if (vma->vm_flags & (VM_IO | VM_PFNMAP)) {
-		struct follow_pfnmap_args args = { .vma = vma, .address = va };
-		int err = follow_pfnmap_start(&args);
+		unsigned long pfn;
+		int err = hc_device_pfn(vma, va, &pfn);
+
 		if (err)
 			return err;
-		*pa = (u64)args.pfn << PAGE_SHIFT;
-		follow_pfnmap_end(&args);
+		*pa = (u64)pfn << PAGE_SHIFT;
 		return 0;
 	}
 	if (get_user_pages_remote(mm, va, 1, FOLL_WRITE, &pg, NULL) != 1)
@@ -202,7 +247,8 @@ static long hc_xlate(struct xnu_hostcall_xlate __user *ua)
 {
 	struct xnu_hostcall_xlate a;
 	struct mm_struct *mm = current->mm;
-	unsigned long i, n;
+	unsigned long i, k, n;
+	u64 pa[64];
 	long err = 0;
 
 	if (copy_from_user(&a, ua, sizeof(a)))
@@ -212,14 +258,18 @@ static long hc_xlate(struct xnu_hostcall_xlate __user *ua)
 	n = a.len >> PAGE_SHIFT;
 	if (n > a.max)
 		return -E2BIG;
-	mmap_read_lock(mm);
-	for (i = 0; i < n && !err; i++) {
-		u64 pa;
-		err = hc_xlate_one(mm, a.va + (i << PAGE_SHIFT), &pa);
-		if (!err && put_user(pa, (u64 __user *)a.out + i))
+	/*
+	 * The answers leave with mmap_lock released: writing one may fault (an output array not in memory yet), the fault
+	 * takes mmap_lock again, and behind another thread that waits to write-lock it (an mmap()) that never returns.
+	 */
+	for (i = 0; i < n && !err; i += k) {
+		mmap_read_lock(mm);
+		for (k = 0; k < ARRAY_SIZE(pa) && i + k < n && !err; k++)
+			err = hc_xlate_one(mm, a.va + ((i + k) << PAGE_SHIFT), &pa[k]);
+		mmap_read_unlock(mm);
+		if (!err && copy_to_user((u64 __user *)a.out + i, pa, k * sizeof(*pa)))
 			err = -EFAULT;
 	}
-	mmap_read_unlock(mm);
 	return err;
 }
 

@@ -19,7 +19,10 @@ def rd(va, k):
 regs = {}
 for i in range(0, n, 4):
     va = va0 + i
-    w = struct.unpack('<I', rd(va, 4))[0]
+    w = rd(va, 4)
+    if w is None or len(w) < 4:
+        print('%x: va not found' % va); break
+    w = struct.unpack('<I', w)[0]
     if (w & 0x9f000000) == 0x90000000:   # adrp
         rd_ = w & 31; immlo = (w >> 29) & 3; immhi = (w >> 5) & 0x7ffff
         imm = (immhi << 2) | immlo
@@ -28,7 +31,7 @@ for i in range(0, n, 4):
     elif (w & 0xffc00000) == 0x91000000:  # add xd, xn, #imm12
         rd_, rn = w & 31, (w >> 5) & 31; imm = (w >> 10) & 0xfff
         if rn in regs:
-            t = regs[rn] + imm
+            t = regs[rd_] = regs[rn] + imm      # (xd holds that address now: an add from it is from there, not from the page)
             s = rd(t, 96) or b''
             s = s.split(b'\0')[0]
             pr = s.decode('latin1') if s and all(32 <= c < 127 for c in s) else ''

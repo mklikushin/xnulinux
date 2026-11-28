@@ -6,10 +6,25 @@
 # regions and loads the Linux kernel image (nokaslr: see below). A CMA area was not enough: one page Linux pins in it
 # during the boot (a buffer-head page of the block device) splits it, and the 8 GB block does not fit.
 # A VM with more memory: LINUX_MEM=15G CARVE_BASE=0x400000000 for 24 GB.
+#   scripts/vm-install-fki-service.sh remove    give the memory back: the command line and the unit as they were before (after
+#                                               scripts/install-service.sh remove; Linux has all of its RAM again after a reboot)
 set -euo pipefail
 P=$(cd "$(dirname "$0")/.." && pwd)
 LINUX_MEM=${LINUX_MEM:-7G}; CARVE_BASE=${CARVE_BASE:-0x200000000}; CARVE_MB=${CARVE_MB:-8156}
 G=/etc/default/grub.d/99-xnulinux.cfg
+if [ "${1:-}" = remove ]; then
+  [ ! -d /sys/module/xnu ] || { echo "a hosted system is running: scripts/install-service.sh remove (or scripts/xnulinux-boot.sh stop) first" >&2; exit 1; }
+  if [ -f /etc/systemd/system/xnulinux-fki.service ]; then sudo systemctl disable --now xnulinux-fki.service; fi
+  sudo rm -f /etc/systemd/system/xnulinux-fki.service "$G"
+  sudo systemctl daemon-reload
+  sudo update-grub >/dev/null 2>&1
+  if [ -d /sys/module/fki ]; then sudo systemctl stop xnudrmd 2>/dev/null || true; sudo rmmod fki; fi	# (xnudrmd holds its /dev/xnu-hostcall)
+  echo "removed: xnulinux-fki.service and the mem= command line ($G); fki.ko is unloaded, and after a reboot Linux has all of the machine's memory again"
+  exit 0
+fi
+# the unit loads fki-ko/fki.ko at every boot, before anything else builds it (xnulinux-boot.sh, which runs from
+# xnulinux.service after this unit): build it now
+make -s -C /lib/modules/$(uname -r)/build M="$P/fki-ko" modules
 # nokaslr: arm64's EFI stub randomises the Linux kernel's physical load address across all EFI memory before mem=
 # takes effect, which otherwise places the kernel image inside the carve-out on some boots (fki then refuses to map it).
 echo "GRUB_CMDLINE_LINUX=\"\$GRUB_CMDLINE_LINUX mem=$LINUX_MEM nokaslr log_buf_len=128M\"" | sudo tee $G >/dev/null

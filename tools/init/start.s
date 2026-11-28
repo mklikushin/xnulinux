@@ -3,7 +3,8 @@
 // open("/dev/console", O_WRONLY), write a line, fork; the child writes its own line and exits 7,
 // the child then execve()s /sbin/hello (which writes its line and exits 7); the parent wait4()s for it, writes a closing line and exits 42.
 // Darwin reports a failed syscall with the carry flag set and errno in x0. Exit codes on failure:
-// open 64+errno, write 128+errno, short write 3, fork 4, wait4 5, child status not 7 or 0: 16+status (8: execve failed, 9: /sbin/hello failed).
+// open 64+errno, write 128+errno, short write 3, fork 4, wait4 5, child killed by a signal 6, child status not 7 or 0: 16+status
+// (8: execve failed, 9: /sbin/hello failed).
 	.text
 	.globl	_start
 	.p2align 2
@@ -38,6 +39,8 @@ Lopen_again:
 	svc	#0x80
 	b.cs	Lwait_failed
 	ldr	w0, [sp]
+	tst	w0, #0x7f		// WTERMSIG: killed (by AMFI, dyld, a fault). Its exit status byte is 0, as for a child that exited well
+	b.ne	Lsignaled
 	lsr	w0, w0, #8		// WEXITSTATUS
 	and	w0, w0, #0xff
 	mov	x23, x0
@@ -110,6 +113,9 @@ Lfork_failed:
 	b	Lexit
 Lwait_failed:
 	mov	x0, #5
+	b	Lexit
+Lsignaled:
+	mov	x0, #6
 	b	Lexit
 Lbad_status:
 	add	x0, x23, #16		// 16 + the child's exit status

@@ -25,6 +25,12 @@ jobs:
         run: |
           test "$(modinfo -F license fki-ko/fki.ko)" = GPL
           test "$(modinfo -F license xnu-ko/xnu.ko)" = Proprietary
+  apple-kc:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: scripts/apple-kc (package.sh, link.sh) on stand-ins for what they read
+        run: tests/apple-kc/run.sh
   spdx:
     runs-on: ubuntu-24.04
     steps:
