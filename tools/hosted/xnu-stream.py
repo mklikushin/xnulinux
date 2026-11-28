@@ -315,7 +315,13 @@ async function start() {
   pc.onconnectionstatechange = () => { if (replaced) return; s.textContent = pc.connectionState; if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) retry(pc.connectionState); };
   await pc.setRemoteDescription({ type: 'offer', sdp: offer.sdp });
   await pc.setLocalDescription(await pc.createAnswer());
-  await new Promise(done => { if (pc.iceGatheringState === 'complete') done(); else { pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && done(); setTimeout(done, 3000); } });
+  await new Promise(done => {
+    if (pc.iceGatheringState === 'complete') return done();
+    let t = setTimeout(done, 3000), fast = 0;
+    const finish = () => { clearTimeout(t); clearTimeout(fast); done(); };
+    pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && finish();
+    pc.onicecandidate = e => { if (!e.candidate) finish(); else if (!fast && /typ (srflx|relay)/.test(e.candidate.candidate)) fast = setTimeout(finish, 150); };
+  });
   await fetch('answer', { method: 'POST', body: pc.localDescription.sdp });
 }
 function at(e) {   // the pointer's place on the screen, 0..1 each way, inside the picture as the page scales it
